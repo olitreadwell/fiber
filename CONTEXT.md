@@ -23,7 +23,7 @@
 - active, well-maintained; docs in /docs/ directory
 
 ## Gap ledger (dedupe — READ FIRST, never re-pick)
-- (none yet for this repo)
+- 2026-09-03: dead-link cleanup PR #1 (fix/dead-links-docs) — 9 dead links fixed in README.md, docs/whats_new.md, docs/middleware/keyauth.md (contrib v3 paths, docs.gofiber.io /middleware/*, recipes envoy-extauthz). Do not re-pick these strings.
 
 ## Mined gaps (discovered, not yet attempted)
 - (none yet)
