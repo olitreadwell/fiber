@@ -1789,7 +1789,7 @@ Deprecated fields `Duration`, `Store`, and `Key` have been removed in v3. Use `E
 
 ### Monitor
 
-Monitor middleware is migrated to the [Contrib package](https://github.com/gofiber/contrib/tree/main/monitor) with [PR #1172](https://github.com/gofiber/contrib/pull/1172).
+Monitor middleware is migrated to the [Contrib package](https://github.com/gofiber/contrib/tree/main/v3/monitor) with [PR #1172](https://github.com/gofiber/contrib/pull/1172).
 
 ### Proxy
 
@@ -3283,7 +3283,7 @@ app.Get("/live", healthcheck.New())
 
 #### Monitor
 
-Since v3 the Monitor middleware has been moved to the [Contrib package](https://github.com/gofiber/contrib/tree/main/monitor)
+Since v3 the Monitor middleware has been moved to the [Contrib package](https://github.com/gofiber/contrib/tree/main/v3/monitor)
 
 ```go
 // Before
