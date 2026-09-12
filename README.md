@@ -143,10 +143,10 @@ These tests are performed by [TechEmpower](https://www.techempower.com/benchmark
 - [Middleware](https://docs.gofiber.io/category/-middleware) & [Next](https://docs.gofiber.io/api/ctx#next) support
 - [Rapid](https://dev.to/koddr/welcome-to-fiber-an-express-js-styled-fastest-web-framework-written-with-on-golang-497) server-side programming
 - [Template Engines](https://github.com/gofiber/template)
-- [WebSocket Support](https://github.com/gofiber/contrib/tree/main/websocket)
-- [Socket.io Support](https://github.com/gofiber/contrib/tree/main/socketio)
+- [WebSocket Support](https://github.com/gofiber/contrib/tree/main/v3/websocket)
+- [Socket.io Support](https://github.com/gofiber/contrib/tree/main/v3/socketio)
 - [Server-Sent Events](https://github.com/gofiber/recipes/tree/master/sse)
-- [Rate Limiter](https://docs.gofiber.io/api/middleware/limiter)
+- [Rate Limiter](https://docs.gofiber.io/middleware/limiter)
 - And much more, [explore Fiber](https://docs.gofiber.io/)
 
 ## 💡 Philosophy
@@ -468,7 +468,7 @@ func main() {
 
 ### Middleware Logger
 
-📖 [Logger](https://docs.gofiber.io/api/middleware/logger)
+📖 [Logger](https://docs.gofiber.io/middleware/logger)
 
 ```go title="Example"
 package main
@@ -497,7 +497,7 @@ func main() {
 
 ### Cross-Origin Resource Sharing (CORS)
 
-📖 [CORS](https://docs.gofiber.io/api/middleware/cors)
+📖 [CORS](https://docs.gofiber.io/middleware/cors)
 
 ```go title="Example"
 package main
@@ -698,7 +698,7 @@ func main() {
 
 ### Recover Middleware
 
-📖 [Recover](https://docs.gofiber.io/api/middleware/recover)
+📖 [Recover](https://docs.gofiber.io/middleware/recover)
 
 ```go title="Example"
 package main
