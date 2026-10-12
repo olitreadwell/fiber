@@ -62,7 +62,7 @@ type Config struct {
 	// You can customize the log output by defining a format string with placeholders
 	// such as: ${time}, ${ip}, ${status}, ${method}, ${path}, ${latency}, ${error}, etc.
 	// The full list of available placeholders can be found in 'tags.go' or at
-	// 'https://docs.gofiber.io/api/middleware/logger/#constants'.
+	// 'https://docs.gofiber.io/middleware/logger/#constants'.
 	//
 	// Fiber provides predefined logging formats that can be used directly:
 	//

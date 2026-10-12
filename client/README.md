@@ -29,7 +29,7 @@ The following samples will assist you to become as comfortable as possible with 
 
 ```go
 // Import Fiber Client into your code and refer it as `client`.
-import "github.com/gofiber/fiber/client"
+import "github.com/gofiber/fiber/v3/client"
 ```
 
 ### Simple GET
