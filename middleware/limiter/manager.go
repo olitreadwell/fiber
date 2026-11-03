@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gofiber/fiber/v3/internal/redact"
+
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/internal/memory"
 	"github.com/gofiber/utils/v2"
@@ -30,8 +32,6 @@ type manager struct {
 	storage          fiber.Storage
 	shouldRedactKeys bool
 }
-
-const redactedKey = "[redacted]"
 
 // maxKeyLength bounds a rate-limit key before it ever reaches storage or the
 // in-memory map.
@@ -94,12 +94,29 @@ func newManager(storage fiber.Storage, shouldRedactKeys bool) *manager {
 	return manager
 }
 
-// acquire returns an *entry from the sync.Pool
+// copiesKeys reports whether the store copies the keys it keeps, as the in-memory fallback does.
+func (m *manager) copiesKeys() bool {
+	return m.storage == nil
+}
+
+// storagePrefix keeps the limiter's entries apart from other middleware sharing the Storage.
+const storagePrefix = "limiter:"
+
+// entryKey is the key get and set take: bounded, and for an external Storage namespaced
+// in a fresh string, so a Storage that keeps it holds no view of the request.
+func (m *manager) entryKey(key string) string {
+	if m.storage != nil {
+		return storagePrefix + boundKey(key)
+	}
+	return boundKey(key)
+}
+
+// acquire returns an *item from the sync.Pool
 func (m *manager) acquire() *item {
 	return m.pool.Get().(*item) //nolint:forcetypeassert,errcheck // We store nothing else in the pool
 }
 
-// release and reset *entry to sync.Pool
+// release resets the *item and returns it to the sync.Pool
 func (m *manager) release(e *item) {
 	e.prevHits = 0
 	e.currHits = 0
@@ -109,7 +126,6 @@ func (m *manager) release(e *item) {
 
 // get data from storage or memory
 func (m *manager) get(ctx context.Context, key string) (*item, error) {
-	key = boundKey(key)
 	if m.storage != nil {
 		raw, err := m.storage.GetWithContext(ctx, key)
 		if err != nil {
@@ -141,7 +157,6 @@ func (m *manager) get(ctx context.Context, key string) (*item, error) {
 
 // set data to storage or memory
 func (m *manager) set(ctx context.Context, key string, it *item, exp time.Duration) error {
-	key = boundKey(key)
 	if m.storage != nil {
 		raw, err := it.MarshalMsg(nil)
 		if err != nil {
@@ -161,8 +176,5 @@ func (m *manager) set(ctx context.Context, key string, it *item, exp time.Durati
 }
 
 func (m *manager) logKey(key string) string {
-	if m.shouldRedactKeys {
-		return redactedKey
-	}
-	return key
+	return redact.Value(key, m.shouldRedactKeys)
 }

@@ -16,19 +16,27 @@ Use the index to jump straight to any `Ctx` method; filter by name or by categor
 
 ### Abandon
 
-Marks the context as abandoned. An abandoned context will not be returned to the pool when `ReleaseCtx` is called. This is used internally by the [timeout middleware](../middleware/timeout.md) to return immediately while the handler goroutine continues safely.
+Marks the context as abandoned. An abandoned context will not be returned to the pool when `ReleaseCtx` is called. This is used internally by the [timeout middleware](../middleware/timeout.md) and the [SSE middleware](../middleware/sse.md) to return immediately while a goroutine continues to use the context safely.
 
 ```go title="Signature"
 func (c fiber.Ctx) Abandon()
 func (c fiber.Ctx) IsAbandoned() bool
 func (c fiber.Ctx) ForceRelease()
+func (c fiber.Ctx) ScheduleReclaim(handlerDone <-chan struct{}, cancel context.CancelFunc)
 ```
 
 | Method         | Description                                                                 |
 |:---------------|:----------------------------------------------------------------------------|
 | `Abandon()`    | Marks the context as abandoned. ReleaseCtx becomes a no-op for this context. |
 | `IsAbandoned()`| Returns `true` if `Abandon()` was called on this context.                   |
-| `ForceRelease()`| Releases an abandoned context back to the pool. Must only be called after the handler has completely finished. |
+| `ForceRelease()`| Releases an abandoned context back to the pool. Must only be called after every goroutine that touches the context has finished, Fiber's own request handler and `ErrorHandler` included; calling it earlier races with them. |
+| `ScheduleReclaim(handlerDone, cancel)`| Abandons the context and returns it to the pool by itself once that is safe: after `handlerDone` is closed and Fiber has released the context. `cancel`, when not `nil`, is called as soon as `handlerDone` is closed. |
+
+`ScheduleReclaim` is the race-free alternative to calling `ForceRelease` yourself, and the way the timeout middleware hands the context to a handler that outlives the request. It calls `Abandon` itself, so calling `Abandon` first is harmless. Close `handlerDone` once the goroutine that still uses the context has completely finished. If it never closes, because the handler never returns, the context is deliberately never reclaimed. It may be called more than once for a request, as happens when one timeout middleware runs inside another: the context is then reclaimed once every `handlerDone` is closed.
+
+:::note
+Only `*fiber.DefaultCtx` signals `ReleaseCtx` that reclamation is armed. With a custom `Ctx` type that embeds it the signal never arrives, so the context is never reclaimed. The timeout middleware uses `Abandon` alone for such types.
+:::
 
 :::caution
 These methods are primarily for internal use and advanced middleware development. Most applications should not need to call them directly.
@@ -143,6 +151,7 @@ Value can be used to retrieve [**`Locals`**](#locals).
 app.Get("/", func(c fiber.Ctx) error {
   c.Locals(userKey, "admin")
   user := c.Value(userKey) // returns "admin"
+  return c.JSON(user)
 })
 ```
 
@@ -188,7 +197,7 @@ app.Get("/api/users/:id", handler).Name("user.show")
 :::info
 `Endpoint` looks ahead, while its neighbors look back: [`Route`](#route) is the route currently executing, which inside middleware is the middleware itself, and [`Matched`](#matched) reports whether an endpoint has been selected yet.
 
-Mounted sub-apps report the flattened, prefixed route. The result is the route the router *would* reach, not a promise that it runs: an earlier middleware can still end the request first.
+Mounted sub-apps report the flattened, prefixed route. The result is the route the router *would* reach, not a promise that it runs: an earlier middleware can still end the request first. A route registered through [`Domain`](./app.md#domain) is only reported for a hostname its pattern matches.
 
 It scans the remaining routes in the request's tree bucket, so calling it from global middleware costs a second router scan per request. That is cheap for routes spread over many prefixes and noticeable when a hundred or more share one, as with everything under `/api/v1`.
 :::
@@ -247,9 +256,39 @@ app.Use(func(c fiber.Ctx) error {
 })
 ```
 
+### GetHeaders
+
+Returns the HTTP request headers as a map, like [`GetReqHeaders`](#getreqheaders): each key maps to a slice with all values for that header.
+
+`Req` and `Res` both carry a `GetHeaders`, so on `Ctx` the request wins, as it does for [`Get`](#get). `c.GetHeaders()` and `c.Req().GetHeaders()` return the request headers, while `c.Res().GetHeaders()` returns the response headers, the same map [`GetRespHeaders`](#getrespheaders) returns.
+
+```go title="Signature"
+func (c fiber.Ctx) GetHeaders() map[string][]string
+func (r fiber.Req) GetHeaders() map[string][]string
+func (r fiber.Res) GetHeaders() map[string][]string
+```
+
+```go title="Example"
+app.Get("/", func(c fiber.Ctx) error {
+  // X-Forwarded-For: 10.0.0.1
+  // X-Forwarded-For: 10.0.0.2
+  fmt.Println(c.GetHeaders()["X-Forwarded-For"]) // => [10.0.0.1 10.0.0.2]
+
+  c.Set("X-Request-Id", "8d7ad5e3")
+  fmt.Println(c.Res().GetHeaders()["X-Request-Id"]) // => [8d7ad5e3]
+
+  // ...
+})
+```
+
+:::info
+The returned value is valid only within the handler. Do not store references.
+Make copies or use the [**`Immutable`**](./fiber.md#immutable) setting instead. [Read more...](../#zero-allocation)
+:::
+
 ### GetReqHeaders
 
-Returns the HTTP request headers as a map. Because a header can appear multiple times in a request, each key maps to a slice with all values for that header.
+Returns the HTTP request headers as a map. Because a header can appear multiple times in a request, each key maps to a slice with all values for that header. It is the `Ctx` name for [`GetHeaders`](#getheaders).
 
 ```go title="Signature"
 func (c fiber.Ctx) GetReqHeaders() map[string][]string
@@ -262,7 +301,7 @@ Make copies or use the [**`Immutable`**](./fiber.md#immutable) setting instead. 
 
 ### GetRespHeader
 
-Returns the HTTP response header specified by the field.
+Returns the HTTP response header specified by the field. On `Res` the same method is called `Get`, so `c.GetRespHeader(key)` and `c.Res().Get(key)` are the same call.
 
 :::tip
 The match is **case-insensitive**.
@@ -270,6 +309,7 @@ The match is **case-insensitive**.
 
 ```go title="Signature"
 func (c fiber.Ctx) GetRespHeader(key string, defaultValue ...string) string
+func (r fiber.Res) Get(key string, defaultValue ...string) string
 ```
 
 ```go title="Example"
@@ -288,10 +328,11 @@ Make copies or use the [**`Immutable`**](./fiber.md#immutable) setting instead. 
 
 ### GetRespHeaders
 
-Returns the HTTP response headers as a map. Since a header can be set multiple times in a single request, the values of the map are slices of strings containing all the different values of the header.
+Returns the HTTP response headers as a map. Since a header can be set multiple times in a single request, the values of the map are slices of strings containing all the different values of the header. On `Res` the same method is called [`GetHeaders`](#getheaders).
 
 ```go title="Signature"
 func (c fiber.Ctx) GetRespHeaders() map[string][]string
+func (r fiber.Res) GetHeaders() map[string][]string
 ```
 
 :::info
@@ -339,8 +380,9 @@ the `%` a second time. Turn `UnescapePath` on, or decode with
 An app with `UnescapePath` enabled decodes `%2F` before route matching, so an
 ordinary single-segment parameter holding a `/` cannot round-trip and returns
 `ErrRouteNotRepresentable`. Greedy (`*` or `+`), adjacent single-byte parameters
-and parameters with a single-byte non-slash terminator retain their existing
-slash-matching rules.
+and required parameters with a single-byte non-slash terminator retain their
+existing slash-matching rules. An optional parameter with such a terminator does
+not match a `/`, so a decoded `/` in its value returns `ErrRouteNotRepresentable`.
 Dot-containing values are also rejected when the composed path has a `.` or
 `..` segment that would be removed during normalization. Surrounding route
 constants are considered: `:name.txt` with `name="."` remains representable.
@@ -349,7 +391,7 @@ Pass a different value or use a route that can represent it; do not pre-encode i
 
 ### Hijack
 
-Registers a handler that takes over the connection once the current response is sent, for protocols Fiber does not speak itself. The handler runs on the connection's own goroutine, after which the connection is closed unless the server has `KeepHijackedConns` set.
+Registers a handler that takes over the connection once the current response is sent, for protocols Fiber does not speak itself. The handler runs on a goroutine of its own once the response has been written, after which the connection is closed unless the server has `KeepHijackedConns` set.
 
 :::caution
 The `Ctx` is pooled and reused, so the hijack handler must not touch it.
@@ -437,7 +479,7 @@ app.Get("/", func(c fiber.Ctx) error {
 
 ### IsMiddleware
 
-Returns `true` if the current request handler was registered as middleware.
+Returns `true` if the current request handler was registered as middleware: a `Use` handler, or any handler of a route other than its last one.
 
 ```go title="Signature"
 func (c fiber.Ctx) IsMiddleware() bool
@@ -584,7 +626,7 @@ app.Use("/john", micro)
 
 ### Next
 
-When **Next** is called, it executes the next method in the stack that matches the current route. You can pass an error struct within the method that will end the chaining and call the [error handler](../guide/error-handling).
+When **Next** is called, it executes the next method in the stack that matches the current route and returns the error that method returned. Return a non-`nil` error from a handler to end the chaining and call the [error handler](../guide/error-handling).
 
 ```go title="Signature"
 func (c fiber.Ctx) Next() error
@@ -620,7 +662,7 @@ func (c fiber.Ctx) OverrideParam(name, value string)
 ```
 
 ```go title="Example"
-// GET http://example.com/user
+// GET http://example.com/user/john
 app.Get("/user/:name", func(c fiber.Ctx) error {
   // mutate parameter
   c.OverrideParam("name", "new value")
@@ -667,7 +709,7 @@ app.Get("/coffee", func(c fiber.Ctx) error {
 })
 
 app.Get("/teapot", func(c fiber.Ctx) error {
-    return c.Status(fiber.StatusTeapot).Send("🍵 short and stout 🍵")
+    return c.Status(fiber.StatusTeapot).SendString("🍵 short and stout 🍵")
 })
 ```
 
@@ -769,19 +811,19 @@ app.Get("/old", func(c fiber.Ctx) error {
 
 ### Route
 
-Returns the matched [Route](https://pkg.go.dev/github.com/gofiber/fiber?tab=doc#Route) struct.
+Returns the matched [Route](https://pkg.go.dev/github.com/gofiber/fiber/v3#Route) struct.
 
 ```go title="Signature"
 func (c fiber.Ctx) Route() *Route
 ```
 
 ```go title="Example"
-// http://localhost:8080/hello
+// http://localhost:8080/hello/john
 
 app.Get("/hello/:name", func(c fiber.Ctx) error {
   r := c.Route()
-  fmt.Println(r.Method, r.Path, r.Params, r.Handlers)
-  // GET /hello/:name handler [name]
+  fmt.Println(r.Method, r.Path, r.Params, len(r.Handlers))
+  // GET /hello/:name [name] 1
 
   // ...
 })
@@ -927,9 +969,11 @@ Each entry lists both forms it can be called in. `DefaultCtx` embeds `DefaultReq
 
 Four entries here are request-related but live on `Ctx` alone and so list only the `fiber.Ctx` form: [`ClientHelloInfo`](#clienthelloinfo), [`RequestID`](#requestid), [`SaveFile`](#savefile) and [`SaveFileToStorage`](#savefiletostorage).
 
+`Req` also carries [`App`](#app), [`Endpoint`](#endpoint), [`Locals`](#locals), [`SetLocal`](#setlocal), [`Request`](#request), [`RequestCtx`](#requestctx) and [`Route`](#route), which are documented at the top of this page under their `Ctx` signatures.
+
 ### AcceptEncoding
 
-Returns the `Accept-Encoding` request header.
+Returns the `Accept-Encoding` request header. Repeated field lines are combined into one comma-joined list ([RFC 9110 Section 5.2](https://www.rfc-editor.org/rfc/rfc9110#section-5.2)), which is the list [`AcceptsEncodings`](#accepts) negotiates on.
 
 ```go title="Signature"
 func (c fiber.Ctx) AcceptEncoding() string
@@ -945,7 +989,7 @@ app.Get("/", func(c fiber.Ctx) error {
 
 ### AcceptLanguage
 
-Returns the `Accept-Language` request header.
+Returns the `Accept-Language` request header. Repeated field lines are combined into one comma-joined list ([RFC 9110 Section 5.2](https://www.rfc-editor.org/rfc/rfc9110#section-5.2)), which is the list [`AcceptsLanguages`](#accepts) negotiates on.
 
 ```go title="Signature"
 func (c fiber.Ctx) AcceptLanguage() string
@@ -964,7 +1008,7 @@ app.Get("/", func(c fiber.Ctx) error {
 Checks if the specified **extensions** or **content** **types** are acceptable.
 
 :::info
-Based on the request’s [Accept](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Accept) HTTP header.
+Based on the request’s [Accept](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Accept) HTTP header. Repeated field lines are combined into one list ([RFC 9110 Section 5.2](https://www.rfc-editor.org/rfc/rfc9110#section-5.2)), and the field name is matched case-insensitively. The other `Accepts*` methods do the same for their own headers.
 :::
 
 ```go title="Signature"
@@ -981,6 +1025,7 @@ func (r fiber.Req) AcceptsLanguagesExtended(offers ...string) string
 ```
 
 ```go title="Example"
+// Accept: text/html, application/json; q=0.8, text/plain; q=0.5; charset="utf-8"
 app.Get("/", func(c fiber.Ctx) error {
   c.Accepts("html")             // "html"
   c.Accepts("text/html")        // "text/html"
@@ -1018,7 +1063,7 @@ app.Get("/", func(c fiber.Ctx) error {
 
 Media-Type parameters are supported.
 
-```go title="Example 3"
+```go title="Example 4"
 // Accept: text/plain, application/json; version=1; foo=bar
 
 app.Get("/", func(c fiber.Ctx) error {
@@ -1033,17 +1078,15 @@ app.Get("/", func(c fiber.Ctx) error {
 })
 ```
 
-```go title="Example 4"
+```go title="Example 5"
 // Accept: text/plain;format=flowed;q=0.9, text/plain
 // i.e., "I prefer text/plain;format=flowed less than other forms of text/plain"
 
 app.Get("/", func(c fiber.Ctx) error {
-  // Beware: the order in which offers are listed matters.
-  // Although the client specified they prefer not to receive format=flowed,
-  // the text/plain Accept matches with "text/plain;format=flowed" first, so it is returned.
-  c.Accepts("text/plain;format=flowed", "text/plain") // "text/plain;format=flowed"
-
-  // Here, things behave as expected:
+  // The offer text/plain;format=flowed is weighed by the most specific range
+  // that matches it, text/plain;format=flowed;q=0.9, while text/plain is weighed
+  // by text/plain (q=1). The client's preference wins in either order.
+  c.Accepts("text/plain;format=flowed", "text/plain") // "text/plain"
   c.Accepts("text/plain", "text/plain;format=flowed") // "text/plain"
 })
 ```
@@ -1081,7 +1124,7 @@ For `Accept-Encoding`, [RFC 9110 §12.5.3](https://www.rfc-editor.org/rfc/rfc911
 - A request whose header is present but empty wants no content coding, so only an `identity` offer matches.
 - `identity` (no coding) is acceptable even when the header does not list it, unless the header excludes it with `identity;q=0`, or with `*;q=0` and no entry of its own for `identity`. An unlisted `identity` ranks below every coding the header does list.
 
-```go title="Example 5"
+```go title="Example 6"
 // Accept-Encoding: gzip
 c.AcceptsEncodings("gzip", "identity") // "gzip"
 c.AcceptsEncodings("br", "identity")   // "identity": br is not listed, identity is acceptable unless excluded
@@ -1262,7 +1305,7 @@ app.Get("/", func(c fiber.Ctx) error {
 
 ### Body
 
-As per the header `Content-Encoding`, this method will try to perform a file decompression from the **body** bytes. In case no `Content-Encoding` header is sent (or when it is set to `identity`), it will perform as [BodyRaw](#bodyraw). If an unknown or unsupported encoding is encountered, the response status will be `415 Unsupported Media Type` or `501 Not Implemented`. Decompression is bounded by the app [BodyLimit](./fiber.md#bodylimit).
+As per the header `Content-Encoding`, this method will try to perform a file decompression from the **body** bytes. It decodes `gzip`, `deflate`, `br` and `zstd`, and several codings are undone in reverse order, up to five: a longer list, `identity` members included, is answered `415 Unsupported Media Type` before anything is decoded. In case no `Content-Encoding` header is sent (or when it is set to `identity`), it will perform as [BodyRaw](#bodyraw). If an unknown or unsupported encoding is encountered, the response status will be `415 Unsupported Media Type` or `501 Not Implemented`. Decompression is bounded by the app [BodyLimit](./fiber.md#bodylimit): a body that decompresses to more than that, or a streamed body larger than that under [`StreamRequestBody`](./fiber.md#streamrequestbody), sets `413 Request Entity Too Large`. These statuses are set only while the response has no body; a response already written, or streamed, is left as it is. Whenever reading or decoding fails, the returned slice holds the error message instead of request data.
 
 ```go title="Signature"
 func (c fiber.Ctx) Body() []byte
@@ -1285,7 +1328,7 @@ Make copies or use the [**`Immutable`**](./fiber.md#immutable) setting instead. 
 
 ### BodyRaw
 
-Returns the raw request **body**.
+Returns the raw request **body**. Under [`StreamRequestBody`](./fiber.md#streamrequestbody), a body larger than the app [BodyLimit](./fiber.md#bodylimit) sets `413 Request Entity Too Large` while no response body was written, and the returned slice holds the error message instead of request data.
 
 ```go title="Signature"
 func (c fiber.Ctx) BodyRaw() []byte
@@ -1308,7 +1351,7 @@ Make copies or use the [**`Immutable`**](./fiber.md#immutable) setting instead. 
 
 ### BodyStream
 
-Returns the request body as a stream. It is only non-`nil` when [`StreamRequestBody`](./fiber.md#config) is enabled and the body has not already been buffered.
+Returns the request body as a stream. It is only non-`nil` when [`StreamRequestBody`](./fiber.md#config) is enabled and the body has not already been buffered. It is the one way to read a body larger than the app [BodyLimit](./fiber.md#bodylimit).
 
 :::caution
 Reading from the returned reader consumes the body, so a later [`Body`](#body) call will not see it.
@@ -1339,7 +1382,7 @@ app.Post("/upload", func(c fiber.Ctx) error {
 
 ### Charset
 
-Returns the `charset` parameter from the `Content-Type` header.
+Returns the `charset` parameter from the `Content-Type` header. Only the first `charset` parameter counts, and the result is empty when its value, once unquoted, is not a [token](https://www.rfc-editor.org/rfc/rfc9110#section-5.6.2): one or more letters, digits or ``!#$%&'*+-.^_`|~``. A broken quoted string also gives an empty result.
 
 ```go title="Signature"
 func (c fiber.Ctx) Charset() string
@@ -1357,7 +1400,7 @@ app.Post("/", func(c fiber.Ctx) error {
 
 ### ClientHelloInfo
 
-`ClientHelloInfo` contains information from the ClientHello message of the TLS connection the request arrived on, to guide application logic in the `GetCertificate` and `GetConfigForClient` callbacks. It is recorded per connection, so concurrent connections never see each other's handshake, and it is `nil` when the app has no TLS handler or the request did not come in over a connection it negotiated. With `Server.MaxConnsPerIP` set, the record for a connection is only dropped once the same connection object is seen again rather than when it closes, because fasthttp recycles the wrapper it reports the close on.
+`ClientHelloInfo` contains information from the ClientHello message of the TLS connection the request arrived on, to guide application logic in the `GetCertificate` and `GetConfigForClient` callbacks. Fiber records it when `crypto/tls` calls the `GetCertificate` callback that [`TLSHandler.GetClientInfo`](./app.md#settlshandler) provides. It is recorded per connection, so concurrent connections never see each other's handshake, and it is `nil` when the app has no TLS handler, when the request did not come in over a connection it negotiated, or when `crypto/tls` did not call that callback for the connection. `crypto/tls` does not call `GetCertificate` for a resumed TLS 1.3 handshake, whatever the configuration: it authenticates with a pre-shared key and picks no certificate. When `tls.Config.Certificates` is set, it also skips the callback for a client that sends no server name (SNI), such as one that connects to an IP address. `Listen` with `CertFile` and `CertKeyFile` is such a configuration. Every other handshake calls it, and `ServerName` is empty for a client that sends none. The record is dropped when the server reports the connection closed or hijacked, and it is found through the wrapper fasthttp puts around a connection when `Server.MaxConnsPerIP` is set.
 Refer to the [ClientHelloInfo](https://golang.org/pkg/crypto/tls/#ClientHelloInfo) struct documentation for details on the returned struct.
 
 ```go title="Signature"
@@ -1376,7 +1419,7 @@ app.Get("/hello", func(c fiber.Ctx) error {
 
 Returns the value of the `Content-Length` request header.
 
-A negative result is **not a length**: `-1` is reported for a chunked body and `-2` for `Transfer-Encoding: identity`, which is also what an ordinary `GET` with no body reports. So `-2`, not `0`, is the common case for a bodyless request — use [`HasBody`](#hasbody) to test whether there is a body at all, and read this only to find out how large a declared one is.
+A negative result is **not a length**: `-1` is reported for a chunked body, and `-2` for a `GET` or `HEAD` request that declares no body, with or without `Transfer-Encoding: identity`. Any other method with no declared body reports `0`, and so does a chunked body with no data unless [`StreamRequestBody`](./fiber.md#streamrequestbody) is enabled, which reports `-1` for every chunked request. Use [`HasBody`](#hasbody) to test whether there is a body at all, and read this only to find out how large a declared one is. It is no cap on the body either: a chunked body reports `-1`, which a comparison like the one in the example below never rejects, so cap the request body with the app [BodyLimit](./fiber.md#bodylimit).
 
 :::note
 `Req` and `Res` both carry a `ContentLength`, so on `Ctx` the request wins, as it does for [`Get`](#get). Use `c.Res().ContentLength()` for the length of the response.
@@ -1448,7 +1491,7 @@ app.Get("/", func(c fiber.Ctx) error {
 
 ### Cookies
 
-Gets a cookie value by key. You can pass an optional default value that will be returned if the cookie key does not exist.
+Gets a cookie value by key. You can pass an optional default value that will be returned if the cookie key does not exist. This reads the cookies the client sent; for the cookies the response is set to send, see [`GetCookies`](#getcookies).
 
 ```go title="Signature"
 func (c fiber.Ctx) Cookies(key string, defaultValue ...string) string
@@ -1471,7 +1514,7 @@ Use [`App.GetString`](./app.md#getstring) or [`App.GetBytes`](./app.md#getbytes)
 
 ### FormFile
 
-MultipartForm files can be retrieved by name, the **first** file from the given key is returned.
+MultipartForm files can be retrieved by name, the **first** file from the given key is returned. The form is parsed within the app [BodyLimit](./fiber.md#bodylimit).
 
 ```go title="Signature"
 func (c fiber.Ctx) FormFile(key string) (*multipart.FileHeader, error)
@@ -1490,7 +1533,7 @@ app.Post("/", func(c fiber.Ctx) error {
 
 ### FormValue
 
-Form values can be retrieved by name, the **first** value for the given key is returned.
+Form values can be retrieved by name, the **first** value for the given key is returned. The query string is searched first, then the urlencoded body, then the multipart form, so a query parameter hides a form field of the same name. A multipart form is parsed within the app [BodyLimit](./fiber.md#bodylimit) and yields no values past it. So is a streamed urlencoded body, under [`StreamRequestBody`](./fiber.md#streamrequestbody), which also sets `413 Request Entity Too Large` while no response body was written.
 
 :::caution
 
@@ -1531,6 +1574,10 @@ When a client sends the Cache-Control: no-cache request header to indicate an en
 
 `Fresh` only applies to GET and HEAD requests and returns false for any other method, since a 304 Not Modified response is only defined for those methods and RFC 9110 requires If-Modified-Since to be ignored otherwise.
 
+The response status must be 2xx or 304. Redirects and errors return false even when the request's validators match, so a freshness check cannot replace them with a 304 response.
+
+The request fields it reads (`If-None-Match`, `If-Modified-Since` and `Cache-Control`) are matched case-insensitively, which matters under [`DisableHeaderNormalizing`](./fiber.md#disableheadernormalizing), where the names are kept as the peer sent them. `If-None-Match` and `Cache-Control` are read across repeated field lines.
+
 Read more on [https://expressjs.com/en/4x/api.html\#req.fresh](https://expressjs.com/en/4x/api.html#req.fresh)
 
 ```go title="Signature"
@@ -1550,7 +1597,7 @@ func (r fiber.Req) FullURL() string
 ```go title="Example"
 // GET http://example.com/search?q=fiber
 
-app.Get("/", func(c fiber.Ctx) error {
+app.Get("/search", func(c fiber.Ctx) error {
   c.FullURL() // "http://example.com/search?q=fiber"
   return nil
 })
@@ -1558,10 +1605,14 @@ app.Get("/", func(c fiber.Ctx) error {
 
 ### Get
 
-Returns the HTTP request header specified by the field.
+Returns the HTTP request header specified by the field. `Res` has a `Get` as well, which reads a response header; see [`GetRespHeader`](#getrespheader).
 
 :::tip
 The match is **case-insensitive**.
+:::
+
+:::note
+Only the header section is read. Fiber drops the trailer section of a request (the fields a chunked request sends after its last chunk) and the `Trailer` field announcing it as the request arrives, which [RFC 9112 Section 7.1.2](https://www.rfc-editor.org/rfc/rfc9112#section-7.1.2) permits, so `Get`, `GetAll`, `HasHeader` and the other request header helpers never return such a field, and a header your code writes under one of its names is returned like any other. A request that names more than 16 trailer fields before the handlers run is refused with `431 Request Header Fields Too Large`. With [`StreamRequestBody`](fiber.md#streamrequestbody), the trailer section arrives only at the end of the body, and Fiber drops it once the body has been read, which also empties `c.Request().Header.RawHeaders()` when the section holds a field. When it names more than 16 fields, reading the body also fails with `ErrRequestHeaderFieldsTooLarge` (`c.Body()` then holds the error text), and the section is dropped all the same.
 :::
 
 ```go title="Signature"
@@ -1576,6 +1627,12 @@ app.Get("/", func(c fiber.Ctx) error {
   c.Get("something", "john")  // "john"
   // ..
 })
+```
+
+`GetReqHeader` is the generic counterpart: it parses the same header into a typed value and returns the default, or the zero value, when the header is missing or does not parse. See the [utils guide](../guide/utils.md#getreqheader).
+
+```go title="Signature"
+func GetReqHeader[V GenericType](c fiber.Ctx, key string, defaultValue ...V) V
 ```
 
 :::caution Repeated field lines
@@ -1619,7 +1676,7 @@ app.Get("/", func(c fiber.Ctx) error {
 
 ### HasBody
 
-Returns `true` if the incoming request contains a body or a `Content-Length` header greater than zero.
+Returns `true` if the incoming request declares a body: a `Content-Length` greater than zero, a chunked body or another `Transfer-Encoding` besides `identity`, or payload data that is already buffered. A chunked body with no data counts only when [`StreamRequestBody`](./fiber.md#streamrequestbody) is enabled. Otherwise the server reads the body before the handler runs and a chunked request that carried no data reaches the handler as `Content-Length: 0` without a `Transfer-Encoding` field, so `HasBody` returns `false`. With `StreamRequestBody` the headers are seen as sent, and every chunked request counts, even an empty one.
 
 ```go title="Signature"
 func (c fiber.Ctx) HasBody() bool
@@ -1637,7 +1694,7 @@ app.Post("/", func(c fiber.Ctx) error {
 
 ### HasHeader
 
-Reports whether the request includes a header with the given key.
+Reports whether the request includes a header with the given key. The field name is matched case-insensitively, and a header whose lines are all empty counts as absent, so the answer agrees with [`GetAll`](#getall).
 
 ```go title="Signature"
 func (c fiber.Ctx) HasHeader(key string) bool
@@ -1673,7 +1730,7 @@ app.Get("/", func(c fiber.Ctx) error {
 
 ### Host
 
-Returns the host derived from the [Host](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Host) HTTP header.
+Returns the host derived from the [Host](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Host) HTTP header. When the request comes from a trusted proxy (see [`TrustProxy`](fiber.md#trustproxy)), the first value of the `X-Forwarded-Host` header is used instead.
 
 In a network context, [`Host`](#host) refers to the combination of a hostname and potentially a port number used for connecting, while [`Hostname`](#hostname) refers specifically to the name assigned to a device on a network, excluding any port information.
 
@@ -1685,7 +1742,7 @@ func (r fiber.Req) Host() string
 ```go title="Example"
 // GET http://google.com:8080/search
 
-app.Get("/", func(c fiber.Ctx) error {
+app.Get("/search", func(c fiber.Ctx) error {
   c.Host()      // "google.com:8080"
   c.Hostname()  // "google.com"
 
@@ -1700,7 +1757,7 @@ Make copies or use the [**`Immutable`**](./fiber.md#immutable) setting instead. 
 
 ### Hostname
 
-Returns the hostname derived from the [Host](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Host) HTTP header.
+Returns the hostname derived from the [Host](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Host) HTTP header, without the port. It is taken from [`Host`](#host), so a trusted proxy's `X-Forwarded-Host` applies here too.
 
 ```go title="Signature"
 func (c fiber.Ctx) Hostname() string
@@ -1710,7 +1767,7 @@ func (r fiber.Req) Hostname() string
 ```go title="Example"
 // GET http://google.com/search
 
-app.Get("/", func(c fiber.Ctx) error {
+app.Get("/search", func(c fiber.Ctx) error {
   c.Hostname() // "google.com"
 
   // ...
@@ -1724,7 +1781,7 @@ Make copies or use the [**`Immutable`**](./fiber.md#immutable) setting instead. 
 
 ### IfModifiedSince
 
-Returns the time carried by the `If-Modified-Since` request header. It returns `fiber.ErrHeaderNotFound` when the header is absent, and a parse error when the value is none of the three HTTP-date formats RFC 9110, Section 5.6.7 requires recipients to accept.
+Returns the time carried by the `If-Modified-Since` request header. It returns `fiber.ErrHeaderNotFound` when the header is absent or empty, and a parse error when the value is none of the three HTTP-date formats RFC 9110, Section 5.6.7 requires recipients to accept.
 
 ```go title="Signature"
 func (c fiber.Ctx) IfModifiedSince() (time.Time, error)
@@ -1793,9 +1850,9 @@ By default, `c.IP()` returns the remote IP address from the TCP connection. When
 
 **Important:** You must enable `TrustProxy` and configure trusted proxy IPs to prevent header spoofing. Simply setting `ProxyHeader` alone will not work.
 
-**Note:** When using a proxy header such as `X-Forwarded-For`, `c.IP()` returns the raw header value unless [`EnableIPValidation`](fiber.md#enableipvalidation) is enabled. Enable it whenever `c.IP()` is used as a single client identifier, for example by the [limiter](../middleware/limiter.md) middleware or an IP allowlist, unless your proxy overwrites the header with a single address: otherwise the raw value can be a comma-separated chain whose leading entries are supplied by the client.
+**Note:** When using a proxy header such as `X-Forwarded-For`, `c.IP()` returns the raw header value unless [`EnableIPValidation`](fiber.md#enableipvalidation) is enabled. A header sent on several field lines is read as one comma-joined list in the order the lines were received ([RFC 9110 Section 5.2](https://www.rfc-editor.org/rfc/rfc9110#section-5.2)), so the raw value and the chain walk below see every proxy's entry whichever line carries it. Without validation, an absent or empty header gives an empty string rather than the TCP remote address. Enable it whenever `c.IP()` is used as a single client identifier, for example by the [limiter](../middleware/limiter.md) middleware or an IP allowlist, unless your proxy overwrites the header with a single address: otherwise the raw value can be a comma-separated chain whose leading entries are supplied by the client.
 
-**Chain parsing with `EnableIPValidation`:** For `X-Forwarded-For`, the raw value is a comma-separated chain that grows from left to right as the request passes through each proxy. With validation enabled, `c.IP()` walks the chain from right to left, skipping every IP that matches the configured `TrustProxyConfig` (exact IPs, CIDR ranges, loopback, private or link-local) and returns the first non-trusted IP it finds. This matches the behavior recommended by [MDN](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Forwarded-For#selecting_an_ip_address) and the convention used by Nginx (`set_real_ip_from` + `real_ip_recursive`), Apache `mod_remoteip`, and Envoy (`xff_num_trusted_hops`).
+**Chain parsing with `EnableIPValidation`:** For `X-Forwarded-For`, the raw value is a comma-separated chain that grows from left to right as the request passes through each proxy. With validation enabled, `c.IP()` walks the chain from right to left, skipping every IP that matches the configured `TrustProxyConfig` (exact IPs, CIDR ranges, loopback, private or link-local) and returns the first non-trusted IP it finds. An entry that is not an IP address, such as `203.0.113.50:51234` or `unknown`, ends the walk like a non-trusted IP, because no trusted proxy wrote it and so nothing to its left can be trusted: `c.IP()` then returns the last trusted proxy it passed, or the TCP remote address. Configure a proxy that appends `IP:port` entries to send the bare address. This matches the behavior recommended by [MDN](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Forwarded-For#selecting_an_ip_address) and the convention used by Nginx (`set_real_ip_from` + `real_ip_recursive`), Apache `mod_remoteip`, and Envoy (`xff_num_trusted_hops`).
 
 If every IP in the chain matches the trusted set, the leftmost IP is returned as a fallback. Trust only your proxies: blanket `Private`, `Loopback` or `LinkLocal` trust is unsafe when clients can also connect from those ranges, because such a client's own entry is skipped and the address it supplied is returned instead; prefer exact proxy addresses or ranges that exclude client networks, or have the proxy overwrite the header. When `TrustProxyConfig` trusts only `UnixSocket`, there are no proxy IPs to skip and the first valid IP from the left is returned. If the chain is empty, `c.IP()` falls back to the TCP remote address.
 :::
@@ -1838,7 +1895,9 @@ See [`TrustProxy`](fiber.md#trustproxy) and [`TrustProxyConfig`](fiber.md#trustp
 
 ### IPs
 
-Returns an array of IP addresses specified in the [X-Forwarded-For](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Forwarded-For) request header, each with the spaces and tabs around it trimmed ([RFC 9110 Section 5.6.3](https://www.rfc-editor.org/rfc/rfc9110#section-5.6.3) allows either as optional whitespace). With `EnableIPValidation`, IPv4, IPv6 and IPv4-mapped IPv6 addresses (`::ffff:203.0.113.5`, as dual-stack proxies forward IPv4 clients) are all accepted; whitespace inside an address makes it invalid.
+Returns an array of IP addresses specified in the [X-Forwarded-For](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Forwarded-For) request header, with repeated field lines read as one comma-joined list and each address's surrounding spaces and tabs trimmed ([RFC 9110 Section 5.6.3](https://www.rfc-editor.org/rfc/rfc9110#section-5.6.3) allows either as optional whitespace). With `EnableIPValidation`, IPv4, IPv6 and IPv4-mapped IPv6 addresses (`::ffff:203.0.113.5`, as dual-stack proxies forward IPv4 clients) are all accepted; whitespace inside an address makes it invalid.
+
+Empty elements, including elements containing only spaces and tabs, are ignored regardless of `EnableIPValidation` ([RFC 9110 Section 5.6.1.2](https://www.rfc-editor.org/rfc/rfc9110#section-5.6.1.2)). For example, `proxy1,,,127.0.0.1,` returns `["proxy1", "127.0.0.1"]` with validation disabled, and a header containing only commas, spaces and tabs returns an empty slice.
 
 ```go title="Signature"
 func (c fiber.Ctx) IPs() []string
@@ -1864,7 +1923,7 @@ Improper use of the X-Forwarded-For header can be a security risk. For details, 
 Returns the matching **content type**, if the incoming request’s [Content-Type](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Type) HTTP header field matches the [MIME type](https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types) specified by the type parameter.
 
 :::info
-If the request has **no** body, it returns **false**.
+Only the media type of the `Content-Type` header is compared, ignoring its parameters and its case, whether or not the request has a body. A request without a `Content-Type` returns **false**.
 :::
 
 ```go title="Signature"
@@ -1904,7 +1963,7 @@ app.Post("/", func(c fiber.Ctx) error {
 
 ### IsFromLocal
 
-Returns `true` if the request came from localhost.
+Returns `true` if the request came from localhost, that is, if the address of the immediate peer is a loopback address. Forwarded headers are not consulted, so behind a reverse proxy on the same host every request is local.
 
 ```go title="Signature"
 func (c fiber.Ctx) IsFromLocal() bool
@@ -1949,8 +2008,8 @@ func (r fiber.Req) IsIdempotent() bool
 
 ```go title="Example"
 app.Use(func(c fiber.Ctx) error {
-  // GET, HEAD, OPTIONS, TRACE, PUT, DELETE => true
-  // POST, PATCH                            => false
+  // GET, HEAD, OPTIONS, TRACE, QUERY, PUT, DELETE => true
+  // POST, PATCH                                   => false
   if c.IsIdempotent() {
     return retryable(c)
   }
@@ -2056,8 +2115,8 @@ func (r fiber.Req) IsSafe() bool
 
 ```go title="Example"
 app.Use(func(c fiber.Ctx) error {
-  // GET, HEAD, OPTIONS, TRACE => true
-  // POST, PUT, PATCH, DELETE  => false
+  // GET, HEAD, OPTIONS, TRACE, QUERY => true
+  // POST, PUT, PATCH, DELETE         => false
   if !c.IsSafe() {
     return requireCSRFToken(c)
   }
@@ -2105,7 +2164,7 @@ app.Post("/", func(c fiber.Ctx) error {
 ### Method
 
 Returns a string corresponding to the HTTP method of the request: `GET`, `POST`, `PUT`, and so on.
-Optionally, you can override the method by passing a string.
+Optionally, you can override the method by passing a string; [Next](#next) then continues with the routes registered after the current one for the new method.
 
 Method tokens are case-sensitive (RFC 9110): the override is first matched exactly against the methods registered in [`Config.RequestMethods`](./fiber.md#requestmethods), and only falls back to the uppercase form as a convenience for the standard methods (e.g. `"get"` → `GET`). An unregistered override is ignored.
 
@@ -2212,7 +2271,7 @@ func (r fiber.Req) OriginalURL() string
 ```go title="Example"
 // GET http://example.com/search?q=something
 
-app.Get("/", func(c fiber.Ctx) error {
+app.Get("/search", func(c fiber.Ctx) error {
   c.OriginalURL() // "/search?q=something"
 
   // ...
@@ -2305,7 +2364,7 @@ The generic `Params` function supports returning the following data types based 
 
 ### Path
 
-Contains the path part of the request URL, normalized before routing as [RFC 3986 Section 6.2.2](https://www.rfc-editor.org/rfc/rfc3986#section-6.2.2) describes: percent-encoded unreserved characters are decoded, other escapes keep their encoding with uppercase hex digits, and `.` and `..` segments are removed, so a request for `/users/../users/%6Aohn` reports `/users/john`. An encoded slash stays encoded and empty segments are kept unless [`UnescapePath`](fiber.md#config) decodes every escape. A stray `%` that begins no escape is kept as sent, except where an escape decoded after it would complete a new escape with it: that `%` is written as `%25`, so `/%%370rivate` reports `/%2570rivate`. The result is not a path to percent-decode again, since an escape it keeps, such as `%2F`, is meant to stay one (see [Routing](../guide/routing.md)). Use [OriginalURL](#originalurl) for the request target as the client sent it. Optionally, you can override the path by passing a string. For internal redirects, you might want to call [RestartRouting](ctx.md#restartrouting) instead of [Next](ctx.md#next).
+Contains the path part of the request URL, normalized before routing as [RFC 3986 Section 6.2.2](https://www.rfc-editor.org/rfc/rfc3986#section-6.2.2) describes: percent-encoded unreserved characters are decoded, other escapes keep their encoding with uppercase hex digits, and `.` and `..` segments are removed, so a request for `/users/../users/%6Aohn` reports `/users/john`. A target without a leading slash is rooted: the asterisk form `OPTIONS *` reports `/*`, and an absolute-form target with an empty path, such as `GET http://host?q`, reports `/`. An encoded slash stays encoded and empty segments are kept unless [`UnescapePath`](fiber.md#config) decodes every escape. A stray `%` that begins no escape is kept as sent, except where an escape decoded after it would complete a new escape with it: that `%` is written as `%25`, so `/%%370rivate` reports `/%2570rivate`. The result is not a path to percent-decode again, since an escape it keeps, such as `%2F`, is meant to stay one (see [Routing](../guide/routing.md)). Use [OriginalURL](#originalurl) for the request target as the client sent it. Optionally, you can override the path by passing a string; [Next](ctx.md#next) then continues with the routes registered after the current one that match the new path. For internal redirects, you might want to call [RestartRouting](ctx.md#restartrouting) instead of [Next](ctx.md#next).
 
 ```go title="Signature"
 func (c fiber.Ctx) Path(override ...string) string
@@ -2327,7 +2386,7 @@ app.Get("/users", func(c fiber.Ctx) error {
 
 ### Port
 
-Returns the remote port of the request.
+Returns the remote port of the request: the port of the connection's remote address, which is the proxy's rather than the client's when the app sits behind one. It is not the port in the `Host` header, which [`Host`](#host) returns. The result is `"0"` when there is no remote address and empty for a Unix socket.
 
 ```go title="Signature"
 func (c fiber.Ctx) Port() string
@@ -2335,10 +2394,11 @@ func (r fiber.Req) Port() string
 ```
 
 ```go title="Example"
-// GET http://example.com:8080
+// The client connects from 192.168.1.10:54321 to http://example.com:8080
 
 app.Get("/", func(c fiber.Ctx) error {
-  c.Port() // "8080"
+  c.Port() // "54321"
+  c.Host() // "example.com:8080"
 
   // ...
 })
@@ -2412,7 +2472,7 @@ app.Get("/", func(c fiber.Ctx) error {
 ```go title="Example"
 // GET /api/posts?filters.author.name=John&filters.category.name=Technology
 
-app.Get("/", func(c fiber.Ctx) error {
+app.Get("/api/posts", func(c fiber.Ctx) error {
     m := c.Queries()
     m["filters.author.name"] // John
     m["filters.category.name"] // Technology
@@ -2422,7 +2482,7 @@ app.Get("/", func(c fiber.Ctx) error {
 ```go title="Example"
 // GET /api/posts?tags=apple,orange,banana&filters[tags]=apple,orange,banana&filters[category][name]=fruits&filters.tags=apple,orange,banana&filters.category.name=fruits
 
-app.Get("/", func(c fiber.Ctx) error {
+app.Get("/api/posts", func(c fiber.Ctx) error {
     m := c.Queries()
     m["tags"] // apple,orange,banana
     m["filters[tags]"] // apple,orange,banana
@@ -2496,22 +2556,28 @@ The generic `Query` function supports returning the following data types based o
 
 ### Range
 
-Returns a struct containing the type and a slice of ranges.
-Only the canonical `bytes` unit is recognized and any optional
+Returns a struct containing the type and a slice of ranges. Each `RangeSet` holds an inclusive `Start` and `End` position, with open-ended and suffix ranges resolved against `size` and `End` limited to the last byte.
+Only the `bytes` unit is recognized (its name is case-insensitive) and any optional
 whitespace around range specifiers will be ignored, as specified
 in RFC 9110. Empty list elements (e.g. `bytes=,0-5`) are ignored, though they
-still count toward `Config.MaxRanges`.
+still count toward [`Config.MaxRanges`](./fiber.md#maxranges).
 A range with a non-numeric bound or a last position smaller than the first
 position invalidates the whole header and `ErrRangeMalformed` (carrying a
-**400 Bad Request** status) is returned, per RFC 9110.
-A grammatically valid range unit other than `bytes` (e.g. `pages=1-3`) returns
+**400 Bad Request** status) is returned, per RFC 9110. So is a request
+without a `Range` header, or one with no `=` in it, so check
+[`HasHeader`](#hasheader) first when the header is optional.
+A range unit other than `bytes` (e.g. `pages=1-3`) returns
 `ErrRangeUnsupported`; RFC 9110 requires servers to **ignore** such a Range
 header, so treat this error as "serve the full representation", not as a
 failure. As a safety net the error carries a **400 Bad Request** status so
 that blindly propagating it does not surface as a 500.
+More list elements than `Config.MaxRanges` (16 by default) sets the HTTP status
+code to **416 Range Not Satisfiable**, sets `Content-Range: bytes */<size>` and
+returns `ErrRangeTooLarge`.
 If the requested ranges are valid but none of them are satisfiable, the method
 automatically sets the HTTP status code to **416 Range Not Satisfiable** and
-populates the `Content-Range` header with the current representation size.
+populates the `Content-Range` header with the current representation size,
+and returns `ErrRequestedRangeNotSatisfiable` together with the parsed `Range`.
 
 ```go title="Signature"
 func (c fiber.Ctx) Range(size int64) (Range, error)
@@ -2521,13 +2587,20 @@ func (r fiber.Req) Range(size int64) (Range, error)
 ```go title="Example"
 // Range: bytes=500-700, 700-900
 app.Get("/", func(c fiber.Ctx) error {
-  r := c.Range(1000)
+  r, err := c.Range(1000)
+  if err != nil {
+    return err
+  }
+
   if r.Type == "bytes" {
-      for _, rng := range r.Ranges {
+    for _, rng := range r.Ranges {
       fmt.Println(rng)
-      // [500, 700]
+      // {500 700}
+      // {700 900}
     }
   }
+
+  return nil
 })
 ```
 
@@ -2549,6 +2622,8 @@ app.Get("/", func(c fiber.Ctx) error {
 
 ### RequestID
 
+Returns the request identifier from the `X-Request-ID` header: the response header when one has been set, for example by the [requestid](../middleware/requestid.md) middleware, otherwise the request header. It returns an empty string when neither is present. To get a number that needs no header, use [`ID`](#id).
+
 ```go title="Signature"
 func (c fiber.Ctx) RequestID() string
 ```
@@ -2565,7 +2640,7 @@ app.Get("/", func(c fiber.Ctx) error {
 Method is used to save **any** multipart file to disk.
 
 ```go title="Signature"
-func (c fiber.Ctx) SaveFile(fh *multipart.FileHeader, path string) error
+func (c fiber.Ctx) SaveFile(fileheader *multipart.FileHeader, path string) error
 ```
 
 ```go title="Example"
@@ -2595,7 +2670,7 @@ app.Post("/", func(c fiber.Ctx) error {
 
 ### SaveFileToStorage
 
-Method is used to save **any** multipart file to an external storage system.
+Method is used to save **any** multipart file to an external storage system. The file is read into memory before it is stored, so a file larger than the app [BodyLimit](./fiber.md#bodylimit) is refused with an error that wraps `fasthttp.ErrBodyTooLarge`.
 
 ```go title="Signature"
 func (c fiber.Ctx) SaveFileToStorage(fileheader *multipart.FileHeader, path string, storage Storage) error
@@ -2644,7 +2719,12 @@ forwarding headers (`X-Forwarded-Proto`, `X-Forwarded-Protocol`,
 ignored rather than passed through — the result is spliced into
 [`BaseURL`](#baseurl) and compared for origin equality by CSRF and
 `Redirect().Back()`, so a header announcing, say, `javascript` must not become
-part of a URL. A proxy that terminates a different protocol should send the
+part of a URL. The headers are ranked in the order listed rather than read in
+the order they arrive: `X-Forwarded-Proto`, the one a reverse proxy sets, wins
+over the other three, which a proxy usually passes through from the client. When
+one header is sent on several lines, the last line received wins. The first
+value of a comma-separated `X-Forwarded-Proto` or `X-Forwarded-Protocol` list is
+the one used. A proxy that terminates a different protocol should send the
 scheme the client used to reach it.
 
 :::
@@ -2666,7 +2746,7 @@ app.Get("/", func(c fiber.Ctx) error {
 
 ### Secure
 
-A boolean property that is `true` if a **TLS** connection is established.
+A boolean property that is `true` if a **TLS** connection is established, or if a trusted proxy reports `https` (see [`Scheme`](#scheme)).
 
 ```go title="Signature"
 func (c fiber.Ctx) Secure() bool
@@ -2698,8 +2778,11 @@ Returns a slice with the host’s sub-domain labels. The dot-separated parts tha
 The `subdomain offset` (default `2`) tells Fiber how many labels, counting from the right-hand side, are always discarded.
 Passing an `offset` argument lets you override that value for a single call.
 
-```go
+The host is taken without its port and lower-cased, a trailing dot is ignored, and punycode labels (`xn--`) are returned decoded. An IP address has no subdomains, so it returns `[]`.
+
+```go title="Signature"
 func (c fiber.Ctx) Subdomains(offset ...int) []string
+func (r fiber.Req) Subdomains(offset ...int) []string
 ```
 
 | `offset`               | Result                                  | Meaning                                       |
@@ -2793,8 +2876,10 @@ Use `c.Res()` to limit gopls suggestions to only these methods!
 
 Each entry lists both forms it can be called in. `DefaultCtx` embeds `DefaultRes`, so the method is promoted: `c.Del(key)` and `c.Res().Del(key)` are the same call.
 
+`Res` also carries [`App`](#app), [`GetRouteURL`](#getrouteurl), [`OriginalURL`](#originalurl), [`Redirect`](#redirect), [`RequestCtx`](#requestctx), [`Response`](#response) and [`ViewBind`](#viewbind), which are documented under their `Ctx` signatures, and the header getters `Get` and `GetHeaders`, documented as [`GetRespHeader`](#getrespheader) and [`GetRespHeaders`](#getrespheaders).
+
 :::caution
-Three names are defined on both `Req` and `Res`: `Body`, `ContentLength` and `ContentType`. On `Ctx` the **request wins**, the way [`Get`](#get) already does, so `c.Body()` reads the request body. The response counterparts are listed below as [`Body (Res)`](#body-res), [`ContentLength (Res)`](#contentlength-res) and [`ContentType (Res)`](#contenttype-res), and are reachable only through `c.Res()` — which is why they list a single `fiber.Res` signature. The response cookies are [`GetCookies`](#getcookies): named apart from `Req.Cookies` so that a `Ctx` still satisfies `fiber.Res`, which a same-name/different-signature pair would prevent.
+Five names mean different things on `Req` and `Res`: `Body`, `ContentLength`, `ContentType`, [`Get`](#get) and [`GetHeaders`](#getheaders). On `Ctx` the **request wins** for all five, so `c.Body()` reads the request body. The response counterparts of the last two are [`GetRespHeader`](#getrespheader) and [`GetRespHeaders`](#getrespheaders); the others are listed below as [`Body (Res)`](#body-res), [`ContentLength (Res)`](#contentlength-res) and [`ContentType (Res)`](#contenttype-res), and are reachable only through `c.Res()` — which is why they list a single `fiber.Res` signature. The response cookies are [`GetCookies`](#getcookies): named apart from `Req.Cookies` so that a `Ctx` still satisfies `fiber.Res`, which a same-name/different-signature pair would prevent.
 :::
 
 ### Add
@@ -2804,7 +2889,7 @@ Appends the given value to the response header field as a **new field line**, le
 This differs from [`Append`](#append), which folds values into a single comma-separated line: headers whose values may themselves contain commas — `WWW-Authenticate`, `Link` — have to be sent as separate lines to stay unambiguous (RFC 9110, Section 5.3).
 
 :::caution
-`Add` does not append for most of the headers fasthttp stores in a slot of their own: `Content-Type`, `Content-Encoding`, `Content-Length`, `Connection`, `Server` and `Trailer` are **replaced**, and `Transfer-Encoding` and `Date` are **ignored** because fasthttp writes them itself. Use [`Set`](#set) for those. `Set-Cookie` is slotted too but does repeat, so `Add` appends a line — prefer [`Cookie`](#cookie), which builds the field value for you.
+`Add` does not append for most of the headers fasthttp stores in a slot of their own: `Content-Type`, `Content-Encoding`, `Content-Length`, `Connection` and `Server` are **replaced**, and `Transfer-Encoding` and `Date` are **ignored** because fasthttp writes them itself. Use [`Set`](#set) for those. `Set-Cookie` is slotted too but does repeat, so `Add` appends a line — prefer [`Cookie`](#cookie), which builds the field value for you. `Trailer` accumulates as well: each `Add` extends the set of announced trailer fields.
 :::
 
 ```go title="Signature"
@@ -2874,6 +2959,8 @@ app.Get("/", func(c fiber.Ctx) error {
 })
 ```
 
+With a filename, the `Content-Type` is set from its extension the way [`Type`](#type) does it, charset included.
+
 The `filename` parameter is emitted as an RFC 9110 quoted-string: spaces and
 punctuation stay literal, and quotes/backslashes are escaped with a backslash
 (no URL encoding). Non-ASCII filenames additionally carry the `filename*`
@@ -2893,6 +2980,8 @@ app.Get("/non-ascii", func(c fiber.Ctx) error {
 
 Performs content-negotiation on the [Accept](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Accept) HTTP header. It uses [Accepts](ctx.md#accepts) to select a proper format.
 The supported content types are `text/html`, `text/plain`, `application/json`, `application/vnd.msgpack`, `application/xml`, and `application/cbor`.
+For `text/html` the body is converted to text, HTML-escaped and wrapped in a `<p>` element.
+`application/vnd.msgpack` and `application/cbor` need an encoder in the app config ([`MsgPackEncoder`](./fiber.md#msgpackencoder), [`CBOREncoder`](./fiber.md#cborencoder)); without one, `AutoFormat` returns an error when the client asks for them.
 Because the representation is selected from the Accept header, `Vary: Accept` is added to the response.
 For more flexible content negotiation, use [Format](ctx.md#format).
 
@@ -2926,7 +3015,7 @@ app.Get("/", func(c fiber.Ctx) error {
 
   // Accept: application/vnd.msgpack
   c.AutoFormat(user)
-  // => 82 a4 6e 61 6d 65 a4 6a 6f 68 6e a4 70 61 73 73 a3 64 6f 65
+  // => 81 a4 4e 61 6d 65 a8 4a 6f 68 6e 20 44 6f 65
 
   // Accept: application/cbor
   c.AutoFormat(user)
@@ -2963,7 +3052,7 @@ app.Use(func(c fiber.Ctx) error {
     return err
   }
 
-  c.Set(fiber.HeaderETag, etag.Generate(c.Res().Body()))
+  c.Set(fiber.HeaderETag, string(etag.Generate(c.Res().Body())))
   return nil
 })
 ```
@@ -3179,6 +3268,14 @@ app.Get("/", func(c fiber.Ctx) error {
 })
 ```
 
+:::info Defaults and reuse
+`Cookie` treats its argument as read-only. The defaults below are applied to a copy, so one `*fiber.Cookie` can be kept as a template and passed on every request.
+
+- An empty `Path` is sent as `/`.
+- `SessionOnly` drops `MaxAge` and `Expires`. Otherwise a positive `MaxAge` sends `Max-Age`, `0` sends none, and a negative value sends `Max-Age=0`, which deletes the cookie.
+- `SameSite` is matched case-insensitively: `Lax`, `Strict` and `None` set the attribute, `disabled` omits it, and an empty or unrecognized value is sent as `Lax`.
+:::
+
 :::caution Cookie values
 The grammar of [RFC 6265 §4.1.1](https://www.rfc-editor.org/rfc/rfc6265#section-4.1.1) allows visible ASCII in a cookie value, without the double quote, the comma, the semicolon, the backslash and whitespace. A `Value` that holds a character outside the grammar is not altered: the cookie is not set, as with an invalid name or `Domain`. The exceptions are the space and the comma, which many applications use: a value with either is written inside double quotes, as `net/http` does (`Value: "hello world"` is sent as `n="hello world"`), and so is a value that already starts and ends with a double quote. The quotes frame the value and are not part of it, so `GetCookie` and the `Cookies` of the request that carries the cookie back return `hello world`.
 
@@ -3241,8 +3338,10 @@ app.Use(func(c fiber.Ctx) error {
 
 Transfers the file from the given path as an `attachment`.
 
-Typically, browsers will prompt the user to download. By default, the [Content-Disposition](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Disposition) header `filename=` parameter is the file path (this typically appears in the browser dialog).
-Override this default with the `filename` parameter.
+Typically, browsers will prompt the user to download. By default, the [Content-Disposition](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Disposition) header `filename=` parameter is the base name of the file path (this typically appears in the browser dialog).
+Override this default with the `filename` parameter; only its base name is used as well.
+
+The file is served through [`SendFile`](#sendfile), so the same rules apply to its name: it is taken literally, and a name built from request input has to be confined by the caller.
 
 ```go title="Signature"
 func (c fiber.Ctx) Download(file string, filename ...string) error
@@ -3331,7 +3430,7 @@ app.Use(func(c fiber.Ctx) error {
     // Log errors & write the error to the response
     if err != nil {
         log.Printf("Got error in middleware: %v", err)
-        return c.Writef("(got error %v)", err)
+        return c.SendString(fmt.Sprintf("(got error %v)", err))
     }
 
     // No errors occurred
@@ -3351,7 +3450,7 @@ app.Get("/", func(c fiber.Ctx) error {
 
 ### Format
 
-Performs content-negotiation on the [Accept](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Accept) HTTP header. It uses [Accepts](ctx.md#accepts) to select a proper format from the supplied offers. A default handler can be provided by setting the `MediaType` to `"default"`. If no offers match and no default is provided, a 406 (Not Acceptable) response is sent. The Content-Type is automatically set when a handler is selected.
+Performs content-negotiation on the [Accept](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Accept) HTTP header. It uses [Accepts](ctx.md#accepts) to select a proper format from the supplied offers, each a `fiber.ResFmt` that pairs a `MediaType` with the `Handler` that writes the response. A default handler can be provided by setting the `MediaType` to `"default"`. If no offers match and no default is provided, a 406 (Not Acceptable) response is sent. The Content-Type is automatically set when a handler is selected. Because the representation is selected from the Accept header, `Vary: Accept` is added to the response, and with a custom `Ctx` the handlers receive that custom type, as route handlers do. Calling `Format` with no handlers returns `fiber.ErrNoHandlers`, and a `nil` `Handler` returns an error rather than panicking.
 
 :::info
 If the Accept header is **not** specified, the first handler with a real media type will be used (entries with the `"default"` media type are skipped, since `"default"` is not a valid Content-Type value). If only a `"default"` handler is supplied, it is called without setting the Content-Type.
@@ -3368,13 +3467,13 @@ func (r fiber.Res) Format(handlers ...ResFmt) error
 // Accept: application/xml => Not Acceptable
 app.Get("/no-default", func(c fiber.Ctx) error {
   return c.Format(
-    fiber.ResFmt{"application/json", func(c fiber.Ctx) error {
+    fiber.ResFmt{MediaType: "application/json", Handler: func(c fiber.Ctx) error {
       return c.JSON(fiber.Map{
         "command": "eat",
         "subject": "fruit",
       })
     }},
-    fiber.ResFmt{"text/plain", func(c fiber.Ctx) error {
+    fiber.ResFmt{MediaType: "text/plain", Handler: func(c fiber.Ctx) error {
       return c.SendString("Eat Fruit!")
     }},
   )
@@ -3389,14 +3488,14 @@ app.Get("/default", func(c fiber.Ctx) error {
   }
 
   handlers := []fiber.ResFmt{
-    {"application/json", func(c fiber.Ctx) error {
+    {MediaType: "application/json", Handler: func(c fiber.Ctx) error {
       return c.JSON(fiber.Map{
         "command": "eat",
         "subject": "fruit",
       })
     }},
-    {"text/plain", textHandler},
-    {"default", textHandler},
+    {MediaType: "text/plain", Handler: textHandler},
+    {MediaType: "default", Handler: textHandler},
   }
 
   return c.Format(handlers...)
@@ -3410,7 +3509,7 @@ Reads back a cookie this response is already set to send, so a later handler or 
 Cookie names are case-sensitive (RFC 6265, Section 4.1.1). A name written more than once resolves to the **first** occurrence; use [`GetCookies`](#getcookies) to see them all.
 
 :::note
-The returned `Cookie` is a copy: changing it does not change the response. Pass it to [`Cookie`](#cookie) to write the change back.
+The returned `Cookie` is a copy: changing it does not change the response. Pass it to [`Cookie`](#cookie) to write the change back. A cookie that expires immediately (`Max-Age=0`) comes back with a `MaxAge` of `-1`, which `Cookie` writes as `Max-Age=0` again.
 :::
 
 :::caution
@@ -3493,14 +3592,14 @@ app.Get("/json", func(c fiber.Ctx) error {
 
   return c.JSON(data)
   // => Content-Type: application/json; charset=utf-8
-  // => {"Name": "Grame", "Age": 20}
+  // => {"Name":"Grame","Age":20}
 
   return c.JSON(fiber.Map{
     "name": "Grame",
     "age":  20,
   })
   // => Content-Type: application/json; charset=utf-8
-  // => {"name": "Grame", "age": 20}
+  // => {"age":20,"name":"Grame"}
 
   return c.JSON(fiber.Map{
     "type":     "https://example.com/probs/out-of-credit",
@@ -3510,13 +3609,7 @@ app.Get("/json", func(c fiber.Ctx) error {
     "instance": "/account/12345/msgs/abc",
   }, "application/problem+json")
   // => Content-Type: application/problem+json
-  // => "{
-  // =>     "type": "https://example.com/probs/out-of-credit",
-  // =>     "title": "You do not have enough credit.",
-  // =>     "status": 403,
-  // =>     "detail": "Your current balance is 30, but that costs 50.",
-  // =>     "instance": "/account/12345/msgs/abc",
-  // => }"
+  // => {"detail":"Your current balance is 30, but that costs 50.","instance":"/account/12345/msgs/abc","status":403,"title":"You do not have enough credit.","type":"https://example.com/probs/out-of-credit"}
 })
 ```
 
@@ -3524,7 +3617,7 @@ app.Get("/json", func(c fiber.Ctx) error {
 
 Sends a JSON response with JSONP support. This method is identical to [JSON](ctx.md#json), except that it opts-in to JSONP callback support. By default, the callback name is simply `callback`.
 
-Override this by passing a **named string** in the method.
+Override this by passing a **named string** in the method. Unlike `JSON`, the response is sent with `Content-Type: text/javascript; charset=utf-8` and `X-Content-Type-Options: nosniff`.
 
 The callback name is reduced to a JavaScript member expression: every character outside `[A-Za-z0-9_$.[]]` is dropped, so names like `window.cb`, `ns.cb[0]`, and `$.jsonp_1` pass through unchanged. Because the name is written straight into a same-origin `text/javascript` body — and JSONP callers normally take it from the query string — leaving it unfiltered would let a request supply arbitrary script for your own origin. If what survives is not a valid member expression, the default `callback` is used: `cb[0]` is emitted, `cb[0x]` is not.
 
@@ -3547,10 +3640,10 @@ app.Get("/", func(c fiber.Ctx) error {
   }
 
   return c.JSONP(data)
-  // => callback({"Name": "Grame", "Age": 20})
+  // => callback({"Name":"Grame","Age":20});
 
   return c.JSONP(data, "customFunc")
-  // => customFunc({"Name": "Grame", "Age": 20})
+  // => customFunc({"Name":"Grame","Age":20});
 })
 ```
 
@@ -3558,6 +3651,7 @@ app.Get("/", func(c fiber.Ctx) error {
 
 Joins the links followed by the property to populate the response’s [Link HTTP header](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Link) field.
 Quotes and backslashes in the `rel` value are escaped so the emitted quoted-string stays grammar-valid per RFC 9110.
+As in Express, the links are added to a `Link` header that is already set, such as the preload links `SendEarlyHints` writes, instead of replacing it.
 
 ```go title="Signature"
 func (c fiber.Ctx) Links(link ...string)
@@ -3602,7 +3696,7 @@ app.Post("/", func(c fiber.Ctx) error {
 
 A compact binary alternative to [JSON](#json) for efficient data transfer between micro-services or from server to client. MessagePack serializes faster and yields smaller payloads than plain JSON.
 
-Converts any **interface** or **string** to MsgPack using the [shamaton/msgpack](https://pkg.go.dev/github.com/shamaton/msgpack/v3) package.
+Converts any **interface** or **string** to MsgPack with the encoder set in [`MsgPackEncoder`](./fiber.md#msgpackencoder). Fiber does not bundle one; [shamaton/msgpack](https://pkg.go.dev/github.com/shamaton/msgpack/v3) is a common choice.
 
 :::info
 MsgPack also sets the content header to the `ctype` parameter. If no `ctype` is passed in, the header is set to `application/vnd.msgpack`.
@@ -3665,7 +3759,7 @@ func (r fiber.Res) NoContent() error
 
 ```go title="Example"
 app.Delete("/item/:id", func(c fiber.Ctx) error {
-  if err := delete(c.Params("id")); err != nil {
+  if err := deleteItem(c.Params("id")); err != nil {
     return err
   }
 
@@ -3681,6 +3775,8 @@ Renders a view with data and sends a `text/html` response. By default, `Render` 
 func (c fiber.Ctx) Render(name string, bind any, layouts ...string) error
 func (r fiber.Res) Render(name string, bind any, layouts ...string) error
 ```
+
+`Render` does not modify `bind`. The [`ViewBind`](#viewbind) values and, with [`PassLocalsToViews`](./fiber.md#passlocalstoviews), the `Locals` of the request are merged into a copy, so the same `fiber.Map` can be reused across requests.
 
 ### ResetBody
 
@@ -3704,7 +3800,7 @@ app.Use(func(c fiber.Ctx) error {
 
 ### Send
 
-Sets the HTTP response body.
+Sets the HTTP response body. The slice is used as it is, without a copy, so it must not be changed after the call.
 
 ```go title="Signature"
 func (c fiber.Ctx) Send(body []byte) error
@@ -3748,8 +3844,8 @@ before the final response. This allows the browser to start preloading
 resources while the server prepares the full response.
 
 :::caution
-This feature requires HTTP/2 or newer. Some legacy HTTP/1.1 clients may not support sendEarlyHints.
-Early Hints (`103` responses) are supported in HTTP/2 and newer. Older HTTP/1.1 clients may ignore these interim responses or misbehave when receiving them.
+Browsers use Early Hints most reliably over HTTP/2 or newer. Some legacy HTTP/1.1 clients may not support `SendEarlyHints`.
+Early Hints (`103` responses) are best supported in HTTP/2 and newer. Older HTTP/1.1 clients may ignore these interim responses or misbehave when receiving them.
 See [Enabling HTTP/2](../guide/reverse-proxy#enabling-http2) for instructions on how to use a reverse proxy (e.g. Nginx or Traefik) to enable HTTP/2 support.
 :::
 
@@ -3876,7 +3972,11 @@ With `ByteRange` on, the file server answers one range of a `GET` request: `Rang
 - The unit is case-insensitive, so `Range: Bytes=0-499` is a range.
 - A request for **several ranges** (`bytes=0-499,1000-1499`), with a **unit the server does not know**, or with a method other than `GET` (`HEAD` included) is answered with the whole file, as if it carried no `Range`. Several ranges used to be refused with `416`, a status that is for ranges that cannot be satisfied.
 - **`If-Range`** makes the range conditional on the file being the one the client holds. The range is served only when the date it carries is exactly the file's `Last-Modified`, and that time is at least two seconds old (the header has whole-second resolution, and a younger file may still change within the second it names); when the file has changed, the whole file is sent instead of a piece that would be spliced onto the client's stale copy. An entity-tag matches only an `ETag` your handler set before calling `SendFile`: the file server sends none. A date cannot tell apart two versions written within the same second, so a file that is replaced in place while clients resume it should carry a strong `ETag`.
-- A range that cannot be satisfied is answered with `416 Range Not Satisfiable`, and with `Content-Range: bytes */<size>` for `SendFile`.
+- A range that cannot be satisfied is answered with `416 Range Not Satisfiable` and `Content-Range: bytes */<size>`.
+:::
+
+:::info Status
+A status set with `Status` before `SendFile` is the status of the whole file. From `300` up, the file is sent whole without looking at `Range`, `If-Range` or `If-Modified-Since`, which apply only to a `2xx` ([RFC 9110 §13.2.1](https://www.rfc-editor.org/rfc/rfc9110#section-13.2.1)). Below `300` it replaces only a `200`: a `206`, `304` or `416` keeps its own. `Download` applies only to a `2xx` and `MaxAge` only below `400`.
 :::
 
 :::info
@@ -3893,6 +3993,10 @@ app.Get("/file", func(c fiber.Ctx) error {
 
 :::info
 You can use multiple `SendFile` calls with different configurations in a single route. Fiber creates different filesystem handlers per config.
+
+A file system whose type is a function (a `func` type with an `Open` method) cannot be told apart from another one, so Fiber keeps no handler for it: a new handler is built, without the file cache, on every call. That keeps the handler cache from growing, but each call costs more than with a struct or pointer type.
+
+Fiber keeps at most 64 handlers per app. A config that is new on every call, such as one whose `FS` is the pointer `fs.Sub` returns or whose `MaxAge` comes from the request, uses them up, and every config that has no handler by then is served the same way, without the file cache. Create such a file system once, outside the handler.
 :::
 
 ```go title="Example"
@@ -3900,7 +4004,7 @@ app.Get("/file", func(c fiber.Ctx) error {
   switch c.Query("config") {
     case "filesystem":
       return c.SendFile("style.css", fiber.SendFile{
-        FS: os.DirFS(".")
+        FS: os.DirFS("."),
       })
     case "filesystem-compress":
       return c.SendFile("style.css", fiber.SendFile{
@@ -3925,7 +4029,9 @@ For sending multiple files from an embedded file system, [this functionality](..
 
 ### SendStatus
 
-Sets the status code and the correct status message in the body if the response body is **empty**.
+Sets the status code and the correct status message in the body if the response body is **empty**. A streamed body counts as a body and is left unread.
+
+A status that cannot carry a body (`1xx`, `204`, `205` and `304`) empties the response body instead, and drops a `Content-Length` header the handler had set. [RFC 9110 Section 8.6](https://www.rfc-editor.org/rfc/rfc9110#section-8.6) requires that for `1xx` and `204`; Fiber also does it for `205` and `304`. A `205` still goes out with `Content-Length: 0`: it has no content ([Section 15.3.6](https://www.rfc-editor.org/rfc/rfc9110#section-15.3.6)), but unlike `1xx`, `204` and `304` it still has to be framed ([RFC 9112 Section 6.3](https://www.rfc-editor.org/rfc/rfc9112#section-6.3)).
 
 :::tip
 You can find all used status codes and messages [in the Fiber source code](https://github.com/gofiber/fiber/blob/dffab20bcdf4f3597d2c74633a7705a517d2c8c2/utils.go#L183-L244).
@@ -4032,6 +4138,10 @@ on the provided writer. Otherwise, the buffered stream flushes after
 `streamWriter` returns.
 :::
 
+:::caution
+`streamWriter` runs on a goroutine of its own that starts when `SendStreamWriter` is called and keeps running after the handler has returned, when `c` may already serve another request, so copy what it needs from `c` before calling `SendStreamWriter` instead of using `c` inside it.
+:::
+
 :::caution HTTP/1.0 clients
 The response is chunked, even for a request older than HTTP/1.1, for the reasons given under [`SendStream`](#sendstream). A client that cannot read a chunked response cannot be sent a stream of unknown size.
 :::
@@ -4089,8 +4199,8 @@ app.Get("/", func(c fiber.Ctx) error {
 Sets the response’s HTTP header field to the specified `key`, `value`.
 
 ```go title="Signature"
-func (c fiber.Ctx) Set(key string, val string)
-func (r fiber.Res) Set(key string, val string)
+func (c fiber.Ctx) Set(key, val string)
+func (r fiber.Res) Set(key, val string)
 ```
 
 ```go title="Example"
@@ -4161,22 +4271,27 @@ app.Use(func(c fiber.Ctx) error {
 
 Sets the [Content-Type](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Type) HTTP header to the MIME type listed [in the Nginx MIME types configuration](https://github.com/nginx/nginx/blob/master/conf/mime.types) specified by the file **extension**.
 
+A text type gets `; charset=utf-8` unless you pass another `charset`: every `text/*` type, `application/json`, `application/javascript`, `application/xml` and any `+json` or `+xml` type. Other types, such as `image/png`, get none.
+
+An extension missing from that list is looked up in the standard library's MIME tables, and the parameters of its answer are dropped: `csv` gives `text/csv`, which takes `charset=utf-8` by the rule above. The header never holds two charsets. Pass `charset` to send another one.
+
 :::info
 This method is **chainable**.
 :::
 
 ```go title="Signature"
-func (c fiber.Ctx) Type(ext string, charset ...string) fiber.Ctx
-func (r fiber.Res) Type(ext string, charset ...string) fiber.Ctx
+func (c fiber.Ctx) Type(extension string, charset ...string) fiber.Ctx
+func (r fiber.Res) Type(extension string, charset ...string) fiber.Ctx
 ```
 
 ```go title="Example"
 app.Get("/", func(c fiber.Ctx) error {
-  c.Type(".html") // => "text/html"
-  c.Type("html")  // => "text/html"
+  c.Type(".html") // => "text/html; charset=utf-8"
+  c.Type("html")  // => "text/html; charset=utf-8"
   c.Type("png")   // => "image/png"
 
-  c.Type("json", "utf-8")  // => "application/json; charset=utf-8"
+  c.Type("json", "utf-8")      // => "application/json; charset=utf-8"
+  c.Type("html", "iso-8859-1") // => "text/html; charset=iso-8859-1"
 
   // ...
 })
@@ -4228,6 +4343,8 @@ app.Get("/", func(c fiber.Ctx) error {
   c.Write([]byte("Hello, World!")) // => "Hello, World!"
 
   fmt.Fprintf(c, "%s\n", "Hello, World!") // => "Hello, World!"
+
+  return nil
 })
 ```
 
@@ -4246,6 +4363,8 @@ app.Get("/", func(c fiber.Ctx) error {
   c.Writef("Hello, %s", world) // => "Hello, World!"
 
   fmt.Fprintf(c, "%s\n", "Hello, World!") // => "Hello, World!"
+
+  return nil
 })
 ```
 
@@ -4260,8 +4379,9 @@ func (r fiber.Res) WriteString(s string) (n int, err error)
 
 ```go title="Example"
 app.Get("/", func(c fiber.Ctx) error {
-  return c.WriteString("Hello, World!")
+  _, err := c.WriteString("Hello, World!")
   // => "Hello, World!"
+  return err
 })
 ```
 

@@ -74,7 +74,11 @@ type Rule struct {
 `From` reaches the compiled pattern as a regular expression, so the other regexp
 metacharacters keep their meaning: `/a.b` also matches `/aXb`, and `/faq?` also
 matches `/fa`. Only `*` is a documented placeholder; write a rule out of path
-text and `*` and it behaves as it reads.
+text and `*` and it behaves as it reads. A `From` that is not a valid regular
+expression, such as `/old(`, makes `New` panic. A rule matches the whole path,
+letter case included: `/old` answers `/old`, but not `/OLD`, `/old/x` or `/very/old`.
+
+In `To`, `$10` is the tenth capture in a rule with ten or more captures, which counts every group of the regular expression and not only the asterisks; in a rule with fewer it reads as `$1` followed by `0`.
 
 Setting both `RuleList` and `Rules` panics: the two disagree about what decides
 precedence, so there is no sensible way to honor them together.
@@ -119,6 +123,13 @@ the browser follows to evil.com.
 **A target naming its own authority**, `{From: "/ext/*", To: "https://cdn.example.com/$1"}`,
 redirects wherever it says. A `$N` after the authority may hold anything,
 including slashes; it can only add to the path.
+
+**A capture never climbs out of the target's path.** The router resolves the `.`
+and `..` segments of the request before a rule sees it, but a composed location
+can spell new ones: `{From: "/@*", To: "/users/$1"}` against `/@../admin`, or
+`/a/.%09./x` under `UnescapePath`, whose decoded tab a client deletes. A location
+holding more dot segments than the target itself is not used, and the next rule
+is tried. `%2e` counts as a dot there, and a backslash, `%2f` and `%5c` as a slash.
 
 **A target naming a scheme but no authority**, `{From: "/m/*", To: "myapp:$1"}`,
 also leaves this application, so the rooting above does not apply to it. A

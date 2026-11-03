@@ -22,8 +22,10 @@ type Res interface {
 	Append(field string, values ...string)
 	// Add appends the value as a new field line, where Append folds values into one
 	// comma-separated line. The headers fasthttp keeps in a slot of their own are
-	// the exception: Content-Type, Server and the rest are replaced and Date and TE
-	// ignored, though Set-Cookie is slotted and does append. Use Cookie for that.
+	// the exception: Content-Type, Content-Encoding, Content-Length, Connection and
+	// Server are replaced, and Transfer-Encoding and Date are ignored because fasthttp
+	// writes them itself. Set-Cookie is slotted too but does append, though Cookie
+	// builds that field value for you. Trailer accumulates, extending the announced set.
 	Add(key, val string)
 	// Attachment sets the HTTP response Content-Disposition header field to attachment.
 	Attachment(filename ...string)
@@ -128,6 +130,8 @@ type Res interface {
 	// This method also sets the content header to application/xml; charset=utf-8.
 	XML(data any) error
 	// Links joins the links followed by the property to populate the response's Link HTTP header field.
+	// Like Express, it adds to a Link header that is already set, such as the preload links
+	// SendEarlyHints writes, instead of replacing it.
 	Links(link ...string)
 	// Location sets the response Location HTTP header to the specified path parameter.
 	Location(path string)
@@ -150,6 +154,7 @@ type Res interface {
 	GetRouteURL(routeName string, params Map) (string, error)
 	// Render a template with data and sends a text/html response.
 	// We support the following engines: https://github.com/gofiber/template
+	// Render does not modify bind, so a Map may be reused across requests.
 	Render(name string, bind any, layouts ...string) error
 	renderExtensions(bind any)
 	// Body returns the response body buffered so far, or nil for a streamed one,

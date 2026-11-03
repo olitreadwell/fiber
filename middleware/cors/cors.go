@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/gofiber/fiber/v3/internal/redact"
+
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/internal/headerlookup"
 	originpkg "github.com/gofiber/fiber/v3/internal/origin"
@@ -17,8 +19,6 @@ import (
 // scheme, since the browser is the party enforcing the check and CORS is
 // used beyond http(s).
 const corsSchemes = originpkg.AnyScheme
-
-const redactedValue = "[redacted]"
 
 // headerLists holds the comma-joined forms of the list-valued CORS response
 // headers. Their sources are fixed when New returns, so each is built once
@@ -100,14 +100,7 @@ func New(config ...Config) fiber.Handler {
 		}
 	}
 
-	redactValues := !cfg.DisableValueRedaction
-
-	maskValue := func(value string) string {
-		if redactValues {
-			return redactedValue
-		}
-		return value
-	}
+	maskValue := redact.Masker(!cfg.DisableValueRedaction)
 
 	// Warning logs if both AllowOrigins and AllowOriginsFunc are set
 	if len(cfg.AllowOrigins) > 0 && cfg.AllowOriginsFunc != nil {
@@ -188,8 +181,11 @@ func New(config ...Config) fiber.Handler {
 		// If the request does not have Origin header, the request is outside the scope of CORS
 		if originHeader == "" {
 			// See https://fetch.spec.whatwg.org/#cors-protocol-and-http-caches
-			// Unless all origins are allowed, we include the Vary header to cache the response correctly
-			if !allowAllOrigins {
+			// The wildcard headers are static, so they go on every response and need no
+			// Vary. OPTIONS is the exception: with Origin it may be a preflight.
+			if allowAllOrigins && c.Method() != fiber.MethodOptions {
+				setSimpleHeaders(c, "*", &cfg, &lists)
+			} else {
 				vary(c, varyOrigin)
 			}
 

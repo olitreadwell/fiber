@@ -7,30 +7,45 @@ import (
 	"math"
 	"mime/multipart"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/gofiber/utils/v2"
+	utilsbytes "github.com/gofiber/utils/v2/bytes"
 	utilsstrings "github.com/gofiber/utils/v2/strings"
 	"github.com/valyala/bytebufferpool"
 	"github.com/valyala/fasthttp"
 	"golang.org/x/net/idna"
 
+	"github.com/gofiber/fiber/v3/internal/bodystream"
 	etagpkg "github.com/gofiber/fiber/v3/internal/etag"
 	"github.com/gofiber/fiber/v3/internal/fieldname"
 	"github.com/gofiber/fiber/v3/internal/headerlist"
 	"github.com/gofiber/fiber/v3/internal/mediatype"
 )
 
-// Pre-allocated byte slices for common header comparisons to avoid allocations
-var (
-	xForwardedPrefix        = []byte("X-Forwarded-")
-	xForwardedProtoBytes    = []byte(HeaderXForwardedProto)
-	xForwardedProtocolBytes = []byte(HeaderXForwardedProtocol)
-	xForwardedSslBytes      = []byte(HeaderXForwardedSsl)
-	xURLSchemeBytes         = []byte(HeaderXUrlScheme)
-	onBytes                 = []byte("on")
+// Pre-allocated for the charset parameter comparison to avoid allocations
+var charsetBytes = []byte("charset")
+
+// maxContentCodings is the longest Content-Encoding list Body undoes; curl stops at five as well.
+const maxContentCodings = 5
+
+// Ranks of the headers Scheme reads, lowest first.
+const (
+	schemeRankNone = iota
+	schemeRankXURLScheme
+	schemeRankXForwardedSsl
+	schemeRankXForwardedProtocol
+	schemeRankXForwardedProto
 )
+
+var schemeHeaders = [...]string{
+	schemeRankXURLScheme:         HeaderXUrlScheme,
+	schemeRankXForwardedSsl:      HeaderXForwardedSsl,
+	schemeRankXForwardedProtocol: HeaderXForwardedProtocol,
+	schemeRankXForwardedProto:    HeaderXForwardedProto,
+}
 
 // Range represents the parsed HTTP Range header extracted by DefaultReq.Range.
 type Range struct {
@@ -99,7 +114,7 @@ func (r *DefaultReq) App() *App {
 	return r.c.app
 }
 
-// BaseURL returns (protocol + host + base path).
+// BaseURL returns (protocol + host), such as "https://example.com". It carries no path.
 func (r *DefaultReq) BaseURL() string {
 	return r.c.BaseURL()
 }
@@ -111,54 +126,59 @@ func (r *DefaultReq) BodyRaw() []byte {
 	return r.getBody()
 }
 
-//nolint:nonamedreturns // gocritic unnamedResult prefers naming decoded body, decode count, and error
-func (r *DefaultReq) tryDecodeBodyInOrder(
-	originalBody *[]byte,
-	encodings []string,
-) (body []byte, decodesRealized uint8, err error) {
-	request := &r.c.fasthttp.Request
-	maxBodySize := r.c.app.config.BodyLimit
-	for idx := range encodings {
-		i := len(encodings) - 1 - idx
-		encoding := encodings[i]
-		decodesRealized++
-		var decodeErr error
-		switch encoding {
-		case StrGzip, "x-gzip":
-			body, decodeErr = request.BodyGunzipWithLimit(maxBodySize)
-		case StrBr, StrBrotli:
-			body, decodeErr = request.BodyUnbrotliWithLimit(maxBodySize)
-		case StrDeflate:
-			body, decodeErr = request.BodyInflateWithLimit(maxBodySize)
-		case StrZstd:
-			body, decodeErr = request.BodyUnzstdWithLimit(maxBodySize)
-		case StrIdentity:
-			body = request.Body()
-		case StrCompress, "x-compress":
-			return nil, decodesRealized - 1, ErrNotImplemented
-		default:
-			return nil, decodesRealized - 1, ErrUnsupportedMediaType
-		}
-
-		if decodeErr != nil {
-			return nil, decodesRealized, decodeErr
-		}
-
-		if i > 0 && decodesRealized > 0 {
-			if i == len(encodings)-1 {
-				tempBody := request.Body()
-				*originalBody = make([]byte, len(tempBody))
-				copy(*originalBody, tempBody)
-			}
-			// identity leaves the body as it is; re-setting an aliasing slice would
-			// release its buffer under ReduceMemoryUsage.
-			if encoding != StrIdentity {
-				request.SetBodyRaw(body)
-			}
-		}
+// tryDecodeBodyInOrder undoes the codings last-applied first and never replaces the request body.
+func (r *DefaultReq) tryDecodeBodyInOrder(encodings []string) ([]byte, error) {
+	// Each member may inflate to BodyLimit on its own, so the list length bounds the work.
+	if len(encodings) > maxContentCodings {
+		return nil, ErrUnsupportedMediaType
 	}
 
-	return body, decodesRealized, nil
+	request := &r.c.fasthttp.Request
+	// The decoders bound what they write, not the stream they read.
+	if err := bodystream.Buffer(request, r.c.app.config.BodyLimit); err != nil {
+		return nil, err
+	}
+	last := len(encodings) - 1
+	body, err := r.decodeContentCoding(request, encodings[last])
+	if err != nil {
+		return nil, err
+	}
+	if last == 0 {
+		return body, nil
+	}
+
+	// Replacing the request body would pool its buffer while Body and BodyRaw
+	// results still alias it (ReduceMemoryUsage, adaptor).
+	scratch := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(scratch)
+	for _, encoding := range slices.Backward(encodings[:last]) {
+		scratch.SetBodyRaw(body)
+		if body, err = r.decodeContentCoding(scratch, encoding); err != nil {
+			return nil, err
+		}
+	}
+	return body, nil
+}
+
+// decodeContentCoding undoes one content coding of src's body within BodyLimit.
+func (r *DefaultReq) decodeContentCoding(src *fasthttp.Request, encoding string) ([]byte, error) {
+	maxBodySize := r.c.app.config.BodyLimit
+	switch encoding {
+	case StrGzip, "x-gzip":
+		return src.BodyGunzipWithLimit(maxBodySize)
+	case StrBr, StrBrotli:
+		return src.BodyUnbrotliWithLimit(maxBodySize)
+	case StrDeflate:
+		return src.BodyInflateWithLimit(maxBodySize)
+	case StrZstd:
+		return src.BodyUnzstdWithLimit(maxBodySize)
+	case StrIdentity:
+		return src.Body(), nil
+	case StrCompress, "x-compress":
+		return nil, ErrNotImplemented
+	default:
+		return nil, ErrUnsupportedMediaType
+	}
 }
 
 // Body contains the raw body submitted in a POST request.
@@ -168,10 +188,10 @@ func (r *DefaultReq) tryDecodeBodyInOrder(
 // If you need to keep the body's data later, make a copy or use the Immutable option.
 func (r *DefaultReq) Body() []byte {
 	var (
-		err                error
-		body, originalBody []byte
-		headerEncoding     string
-		encodingOrder      = []string{"", "", ""}
+		err            error
+		body           []byte
+		headerEncoding string
+		encodingOrder  = []string{"", "", ""}
 	)
 
 	request := &r.c.fasthttp.Request
@@ -201,15 +221,11 @@ func (r *DefaultReq) Body() []byte {
 		return r.getBody()
 	}
 
-	var decodesRealized uint8
-	body, decodesRealized, err = r.tryDecodeBodyInOrder(&originalBody, encodingOrder)
-
-	// Ensure that the body will be the original
-	if originalBody != nil && decodesRealized > 0 {
-		request.SetBodyRaw(originalBody)
-	}
+	body, err = r.tryDecodeBodyInOrder(encodingOrder)
 	if err != nil {
 		switch {
+		case r.c.Written():
+			// a response already written stays as the handler left it
 		case errors.Is(err, ErrUnsupportedMediaType):
 			_ = r.c.DefaultRes.SendStatus(StatusUnsupportedMediaType) //nolint:errcheck,staticcheck // It is fine to ignore the error and the static check
 		case errors.Is(err, ErrNotImplemented):
@@ -260,12 +276,21 @@ func (r *DefaultReq) FullURL() string {
 
 // UserAgent returns the User-Agent request header.
 func (r *DefaultReq) UserAgent() string {
-	return r.c.app.toString(r.c.fasthttp.Request.Header.UserAgent())
+	h := &r.c.fasthttp.Request.Header
+	// fasthttp's accessors fall through to the trailer section.
+	if fieldname.HasTrailers(h) {
+		return r.c.app.toString(r.headerField(HeaderUserAgent))
+	}
+	return r.c.app.toString(h.UserAgent())
 }
 
 // Referer returns the Referer request header.
 func (r *DefaultReq) Referer() string {
-	return r.c.app.toString(r.c.fasthttp.Request.Header.Referer())
+	h := &r.c.fasthttp.Request.Header
+	if fieldname.HasTrailers(h) {
+		return r.c.app.toString(r.headerField(HeaderReferer))
+	}
+	return r.c.app.toString(h.Referer())
 }
 
 // Origin returns the Origin request header.
@@ -339,73 +364,15 @@ func (r *DefaultReq) ContentType() string {
 
 // MediaType returns the MIME type from the Content-Type header without parameters.
 func (r *DefaultReq) MediaType() string {
-	contentType := utils.TrimSpace(r.c.fasthttp.Request.Header.ContentType())
-	if len(contentType) == 0 {
-		return ""
-	}
-	if idx := bytes.IndexByte(contentType, ';'); idx != -1 {
-		contentType = contentType[:idx]
-	}
-	contentType = utils.TrimSpace(contentType)
-	return r.c.app.toString(contentType)
+	return r.c.app.toString(mediatype.StripParams(r.c.fasthttp.Request.Header.ContentType()))
 }
 
 // Charset returns the charset parameter from the Content-Type header.
 func (r *DefaultReq) Charset() string {
-	contentType := r.c.fasthttp.Request.Header.ContentType()
-	_, params, ok := utils.CutByte(contentType, ';')
-	if !ok {
-		return ""
-	}
-	for len(params) > 0 {
-		// Slice off the next parameter at the next ";" that sits outside a
-		// quoted-string: parameter values may be quoted and contain ";"
-		// (RFC 9110 Section 5.6.6). A DQUOTE only opens a quoted-string at
-		// the start of a value (after an "=" plus optional whitespace), so a
-		// stray quote later in an unquoted value cannot swallow the rest of
-		// the header.
-		param := params
-		end := -1
-		inQuotes := false
-		escaped := false
-		expectValue := false
-	scan:
-		for i := 0; i < len(params); i++ {
-			ch := params[i]
-			switch {
-			case escaped:
-				escaped = false
-			case inQuotes:
-				switch ch {
-				case '\\':
-					escaped = true
-				case '"':
-					inQuotes = false
-				}
-			case ch == '=':
-				expectValue = true
-			case ch == '"' && expectValue:
-				inQuotes = true
-				expectValue = false
-			case ch == ';':
-				end = i
-				break scan
-			case ch != ' ' && ch != '\t':
-				expectValue = false
-			}
-		}
-		if end >= 0 {
-			param = params[:end]
-			params = params[end+1:]
-		} else {
-			params = nil
-		}
-
-		name, value, ok := utils.CutByte(param, '=')
-		if !ok || !utils.EqualFold(utils.TrimSpace(name), []byte("charset")) {
+	for name, v := range mediatype.Params(r.c.fasthttp.Request.Header.ContentType()) {
+		if !utils.EqualFold(name, charsetBytes) {
 			continue
 		}
-		v := utils.TrimSpace(value)
 		if len(v) > 0 && v[0] == '"' {
 			// A quoted value must be a complete quoted-string, and its
 			// quoted-pairs must be replaced with the escaped octet
@@ -413,16 +380,16 @@ func (r *DefaultReq) Charset() string {
 			if len(v) < 2 || v[len(v)-1] != '"' {
 				return ""
 			}
-			unescaped, err := unescapeHeaderValue(v[1 : len(v)-1])
-			if err != nil {
+			unescaped, ok := mediatype.Unescape(v[1 : len(v)-1])
+			if !ok {
 				return ""
 			}
 			v = unescaped
-		} else if bytes.IndexByte(v, '"') >= 0 {
-			// A bare token must not contain DQUOTE; skip the invalid
-			// parameter instead of surfacing garbage, so a well-formed
-			// charset parameter later in the header can still be found.
-			continue
+		}
+		// A charset is a token, quoted or not (RFC 9110 Section 8.3.2). The first
+		// charset parameter decides, so a malformed one is not skipped.
+		if !mediatype.IsToken(v) {
+			return ""
 		}
 		return r.c.app.toString(v)
 	}
@@ -561,6 +528,15 @@ func (r *DefaultReq) FormValue(key string, defaultValue ...string) string {
 		}
 		return defaultString("", defaultValue)
 	}
+	// PostArgs drains a streamed urlencoded body whatever its size.
+	if r.c.fasthttp.Request.IsBodyStream() && mediatype.ParsesPostArgs(r.c.fasthttp.Request.Header.ContentType()) {
+		if v := r.c.fasthttp.QueryArgs().Peek(key); len(v) > 0 {
+			return r.c.app.toString(v)
+		}
+		if err := r.bufferBodyStream(); err != nil {
+			return defaultString("", defaultValue)
+		}
+	}
 	return defaultString(r.c.app.toString(r.c.fasthttp.FormValue(key)), defaultValue)
 }
 
@@ -570,6 +546,7 @@ func (r *DefaultReq) FormValue(key string, defaultValue ...string) string {
 // Freshness only applies to GET and HEAD requests; for any other method false is
 // returned, as RFC 9110 defines 304 Not Modified only for those methods and
 // requires If-Modified-Since to be ignored otherwise.
+// The response status must be 2xx or 304; redirects and errors are never fresh.
 // When a client sends the Cache-Control: no-cache request header to indicate an end-to-end
 // reload request, this module will return false to make handling these requests transparent.
 // https://github.com/jshttp/fresh/blob/master/index.js#L33
@@ -583,6 +560,13 @@ func (r *DefaultReq) Fresh() bool {
 		return false
 	}
 	if method := r.c.app.method(r.c.methodInt); method != MethodGet && method != MethodHead {
+		return false
+	}
+
+	// Redirects and errors take precedence over request preconditions (RFC
+	// 9110 Section 13.2.1). Like Express, an existing 304 can remain fresh.
+	status := r.c.fasthttp.Response.StatusCode()
+	if (status < StatusOK || status >= StatusMultipleChoices) && status != StatusNotModified {
 		return false
 	}
 
@@ -776,7 +760,25 @@ func (r *DefaultReq) GetHeaders() map[string][]string {
 	reqHeader := &r.c.fasthttp.Request.Header
 	// Pre-allocate map with known header count to avoid reallocations
 	headers := make(map[string][]string, reqHeader.Len())
+	// Lines under a trailer name are left out, as c.Get leaves them; one set, not InTrailer per line, keeps it linear.
+	var (
+		trailers map[string]struct{}
+		lower    []byte
+	)
+	if keys := reqHeader.PeekTrailerKeys(); len(keys) > 0 {
+		trailers = make(map[string]struct{}, len(keys))
+		for _, key := range keys {
+			lower = utilsbytes.UnsafeToLower(append(lower[:0], key...))
+			trailers[string(lower)] = struct{}{}
+		}
+	}
 	for k, v := range reqHeader.All() {
+		if trailers != nil {
+			lower = utilsbytes.UnsafeToLower(append(lower[:0], k...))
+			if _, ok := trailers[string(lower)]; ok {
+				continue
+			}
+		}
 		key := app.toString(k)
 		headers[key] = append(headers[key], app.toString(v))
 	}
@@ -861,10 +863,9 @@ func (r *DefaultReq) IP() string {
 }
 
 // extractIPsFromHeader will return a slice of IPs it found given a header name in the order they appear.
+// Empty elements are ignored after trimming optional whitespace.
 // When IP validation is enabled, any invalid IPs will be omitted.
 func (r *DefaultReq) extractIPsFromHeader(header string) []string {
-	// TODO: Reuse the c.extractIPFromHeader func somehow in here
-
 	headerValue := proxyHeaderValue(r, header)
 
 	// We can't know how many IPs we will return, but we will try to guess with this constant division.
@@ -875,44 +876,18 @@ func (r *DefaultReq) extractIPsFromHeader(header string) []string {
 		maxEstimatedCount)
 
 	ipsFound := make([]string, 0, estimatedCount)
+	validate := r.c.app.config.EnableIPValidation
 
-	i := 0
-	j := -1
-
-	for {
-		var v4, v6 bool
-
-		// Manually splitting string without allocating slice, working with parts directly
-		i, j = j+1, j+2
-
-		if j > len(headerValue) {
-			break
+	for start := 0; start < len(headerValue); {
+		var s string
+		s, start = headerlist.Next(headerValue, start)
+		s = headerlist.TrimOWS(s)
+		// RFC 9110 Section 5.6.1.2: recipients ignore empty list elements.
+		if s == "" {
+			continue
 		}
-
-		for j < len(headerValue) && headerValue[j] != ',' {
-			switch headerValue[j] {
-			case ':':
-				v6 = true
-			case '.':
-				v4 = true
-			default:
-				// do nothing
-			}
-			j++
-		}
-
-		for i < j && headerValue[i] == ',' {
-			i++
-		}
-
-		s := headerlist.TrimOWS(headerValue[i:j])
-
-		if r.c.app.config.EnableIPValidation {
-			// Skip validation if IP is clearly not IPv4/IPv6; otherwise, validate without allocations.
-			// A colon decides: an IPv4-mapped IPv6 address carries both separators.
-			if (!v6 && !v4) || (v6 && !utils.IsIPv6(s)) || (!v6 && v4 && !utils.IsIPv4(s)) {
-				continue
-			}
+		if validate && !utils.IsIPv4(s) && !utils.IsIPv6(s) {
+			continue
 		}
 
 		ipsFound = append(ipsFound, s)
@@ -923,9 +898,9 @@ func (r *DefaultReq) extractIPsFromHeader(header string) []string {
 
 // extractIPFromHeader returns the client IP from the given proxy header by walking the
 // X-Forwarded-For chain from right to left and stripping trusted proxy IPs. When trusted
-// proxies are configured, the rightmost non-trusted IP is returned; otherwise the first
-// valid IP (left-to-right) is returned. When IP validation is disabled, the raw header
-// value is returned as-is.
+// proxies are configured, the rightmost non-trusted IP is returned, and an entry that is not
+// an IP ends the walk; otherwise the first valid IP (left-to-right) is returned. When IP
+// validation is disabled, the raw header value is returned as-is.
 func (r *DefaultReq) extractIPFromHeader(header string) string {
 	app := r.c.app
 
@@ -936,44 +911,36 @@ func (r *DefaultReq) extractIPFromHeader(header string) string {
 	headerValue := proxyHeaderValue(r, header)
 	hasTrustedProxyConfig := r.hasTrustedProxyConfig()
 	if !hasTrustedProxyConfig {
-		start := 0
-		for {
-			end := start
-			for end < len(headerValue) && headerValue[end] != ',' {
-				end++
-			}
-
-			ipStr := headerlist.TrimOWS(headerValue[start:end])
+		for start := 0; start <= len(headerValue); {
+			var ipStr string
+			ipStr, start = headerlist.Next(headerValue, start)
+			ipStr = headerlist.TrimOWS(ipStr)
 			if isValidProxyIP(ipStr) {
 				return ipStr
 			}
-			if end == len(headerValue) {
-				break
-			}
-			start = end + 1
 		}
 	}
 
 	var leftmostIP string
 
 	for end := len(headerValue); end > 0; {
-		start := end
-		for start > 0 && headerValue[start-1] != ',' {
-			start--
-		}
+		ipStr, prev := headerlist.Prev(headerValue, end)
 
-		ipStr := headerlist.TrimOWS(headerValue[start:end])
-		if isValidProxyIP(ipStr) {
+		// An empty list element is no element (RFC 9110 Section 5.6.1).
+		if ipStr = headerlist.TrimOWS(ipStr); ipStr != "" {
+			if !isValidProxyIP(ipStr) {
+				// "IP:port", "unknown" and the like name no trusted proxy, so nothing left of them can be trusted.
+				break
+			}
 			leftmostIP = ipStr
 			if !r.isTrustedProxyIP(ipStr) {
 				return ipStr
 			}
 		}
-
-		if start == 0 {
+		if prev < 0 {
 			break
 		}
-		end = start - 1
+		end = prev
 	}
 
 	if leftmostIP != "" {
@@ -989,7 +956,7 @@ func (r *DefaultReq) extractIPFromHeader(header string) string {
 // RFC 9110 Section 5.2. This ensures security-sensitive IP extraction sees the
 // complete chain when an adapter or proxy preserves separate field lines.
 func proxyHeaderValue(r *DefaultReq, header string) string {
-	value := peekJoinedRequestHeader(&r.c.fasthttp.Request.Header, header)
+	value := peekReceivedRequestHeader(&r.c.fasthttp.Request, header)
 	return r.c.app.toString(value)
 }
 
@@ -1073,12 +1040,8 @@ func (r *DefaultReq) Is(extension string) bool {
 		return false
 	}
 
-	ct := r.c.app.toString(r.c.fasthttp.Request.Header.ContentType())
-	if i := strings.IndexByte(ct, ';'); i != -1 {
-		ct = ct[:i]
-	}
-	ct = utils.TrimSpace(ct)
-	return utils.EqualFold(ct, extensionHeader)
+	ct := mediatype.StripParams(r.c.fasthttp.Request.Header.ContentType())
+	return utils.EqualFold(utils.UnsafeString(ct), extensionHeader)
 }
 
 // HasBody returns true if the request declares a body via Content-Length, Transfer-Encoding, or already buffered payload data.
@@ -1304,8 +1267,8 @@ func (r *DefaultReq) Method(override ...string) string {
 	if methodInt == r.c.methodInt {
 		return method
 	}
-	// A middleware sits at a position of its own in every method's tree, so
-	// carry the index over or Next would skip the routes before it.
+	// The old index is a position in another tree, so place this route in the
+	// new one or Next would skip routes registered after it.
 	r.c.indexRoute = app.routeIndexInTree(methodInt, r.c.treePathHash, r.c.route, r.c.indexRoute)
 	r.c.methodInt = methodInt
 	// Method changed; invalidate the lookahead index
@@ -1394,8 +1357,8 @@ func (r *DefaultReq) Path(override ...string) string {
 		r.c.configDependentPaths()
 		// The detection path/tree hash changed; invalidate the lookahead index.
 		r.c.firstMatchIndex = -1
-		// The new path may live in another bucket, so carry the index over for
-		// Next to resume after this route.
+		// The new path may live in another bucket, so place this route there for
+		// Next to resume after it.
 		r.c.indexRoute = r.c.app.routeIndexInTree(r.c.methodInt, r.c.treePathHash, r.c.route, r.c.indexRoute)
 	}
 	return r.c.app.toString(r.c.path)
@@ -1464,37 +1427,64 @@ func (r *DefaultReq) Scheme() string {
 		return schemeHTTP
 	}
 
-	app := r.c.app
-	scheme := schemeHTTP
-	const lenXHeaderName = 12
-	for key, val := range ctx.Request.Header.All() {
-		if len(key) < lenXHeaderName {
-			continue // Neither "X-Forwarded-" nor "X-Url-Scheme"
-		}
-		switch {
-		case utils.EqualFold(key[:len(xForwardedPrefix)], xForwardedPrefix):
-			if utils.EqualFold(key, xForwardedProtoBytes) ||
-				utils.EqualFold(key, xForwardedProtocolBytes) {
-				v := app.toString(val)
-				if before, _, found := utils.CutByte(v, ','); found {
-					v = before
-				}
-				if forwarded, ok := forwardedScheme(v); ok {
-					scheme = forwarded
-				}
-			} else if utils.EqualFold(key, xForwardedSslBytes) && utils.EqualFold(val, onBytes) {
-				scheme = schemeHTTPS
-			}
-
-		case utils.EqualFold(key, xURLSchemeBytes):
-			if forwarded, ok := forwardedScheme(app.toString(val)); ok {
-				scheme = forwarded
-			}
-		default:
+	// Ranked, not read in wire order: a proxy sets X-Forwarded-Proto and usually relays the others from the client.
+	header := &ctx.Request.Header
+	scheme, rank, conflict := schemeHTTP, schemeRankNone, false
+	for key, val := range header.All() {
+		keyRank := schemeHeaderRank(key)
+		if keyRank == schemeRankNone || keyRank < rank {
 			continue
 		}
+		if announced, ok := announcedScheme(keyRank, val); ok {
+			conflict = keyRank == rank && (conflict || announced != scheme)
+			scheme, rank = announced, keyRank
+		}
 	}
+	if !conflict {
+		return scheme
+	}
+	// Repeats of one header keep the last line, so the order they were received in decides.
+	fieldname.ReceivedOrder(header, fieldname.Received(&ctx.Request), schemeHeaders[rank], func(line []byte) {
+		if announced, ok := announcedScheme(rank, line); ok {
+			scheme = announced
+		}
+	})
 	return scheme
+}
+
+func schemeHeaderRank(key []byte) int {
+	// The four names differ in length, which the compiler checks through the case values.
+	var rank int
+	switch len(key) {
+	case len(HeaderXForwardedProto):
+		rank = schemeRankXForwardedProto
+	case len(HeaderXForwardedProtocol):
+		rank = schemeRankXForwardedProtocol
+	case len(HeaderXForwardedSsl):
+		rank = schemeRankXForwardedSsl
+	case len(HeaderXUrlScheme):
+		rank = schemeRankXURLScheme
+	default:
+		return schemeRankNone
+	}
+	if !utils.EqualFold(utils.UnsafeString(key), schemeHeaders[rank]) {
+		return schemeRankNone
+	}
+	return rank
+}
+
+// announcedScheme returns the scheme a header of the given rank announces.
+func announcedScheme(rank int, val []byte) (string, bool) {
+	v := utils.UnsafeString(val)
+	switch rank {
+	case schemeRankXForwardedSsl:
+		return schemeHTTPS, utils.EqualFold(v, "on")
+	case schemeRankXForwardedProto, schemeRankXForwardedProtocol:
+		if before, _, found := utils.CutByte(v, ','); found {
+			v = before
+		}
+	}
+	return forwardedScheme(v)
 }
 
 // forwardedScheme canonicalizes a scheme announced by a proxy header. Only
@@ -1883,5 +1873,19 @@ func (r *DefaultReq) IsFromUnixSocket() bool {
 }
 
 func (r *DefaultReq) getBody() []byte {
+	if r.c.fasthttp.Request.IsBodyStream() {
+		if err := r.bufferBodyStream(); err != nil {
+			return []byte(err.Error())
+		}
+	}
 	return r.c.app.GetBytes(r.c.fasthttp.Request.Body())
+}
+
+// bufferBodyStream applies BodyLimit to a streamed body and answers a larger one 413 while no response body was written, as the server would.
+func (r *DefaultReq) bufferBodyStream() error {
+	err := bodystream.Buffer(&r.c.fasthttp.Request, r.c.app.config.BodyLimit)
+	if errors.Is(err, fasthttp.ErrBodyTooLarge) && !r.c.Written() {
+		_ = r.c.DefaultRes.SendStatus(StatusRequestEntityTooLarge) //nolint:errcheck,staticcheck // It is fine to ignore the error and the static check
+	}
+	return err
 }

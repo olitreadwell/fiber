@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/internal/crosshost"
 	"github.com/gofiber/utils/v2"
 	"github.com/valyala/fasthttp"
 )
@@ -62,6 +63,8 @@ type Request struct {
 	boundary   string
 	referer    string
 	files      []*File
+
+	redirectSensitiveHeaders crosshost.HeaderNames
 
 	timeout      time.Duration
 	maxRedirects int
@@ -162,9 +165,12 @@ func (r *Request) Headers() iter.Seq2[string, []string] {
 		peekKeys := r.header.PeekKeys()
 
 		// Copy keys to immutable strings to decouple from fasthttp's internal buffers.
-		keys := make([]string, len(peekKeys))
-		for i, key := range peekKeys {
-			keys[i] = utils.UnsafeString(key)
+		// PeekKeys lists a key once per header line; keep the first occurrence only.
+		keys := make([]string, 0, len(peekKeys))
+		for _, key := range peekKeys {
+			if k := utils.UnsafeString(key); !slices.Contains(keys, k) {
+				keys = append(keys, k)
+			}
 		}
 
 		for _, key := range keys {
@@ -610,6 +616,18 @@ func (r *Request) SetMaxRedirects(count int) *Request {
 	return r
 }
 
+// RedirectSensitiveHeaders returns a copy of this Request's names.
+func (r *Request) RedirectSensitiveHeaders() []string {
+	return r.redirectSensitiveHeaders.List()
+}
+
+// SetRedirectSensitiveHeaders names headers to drop when a redirect leaves the host, in addition to
+// the client's list and the built-in set. It replaces this Request's previous names.
+func (r *Request) SetRedirectSensitiveHeaders(names ...string) *Request {
+	r.redirectSensitiveHeaders = crosshost.NewHeaderNames(names)
+	return r
+}
+
 // DisablePathNormalizing reports whether path normalizing is disabled for the Request.
 func (r *Request) DisablePathNormalizing() bool {
 	return r.isPathNormalizingDisabled
@@ -693,6 +711,7 @@ func (r *Request) Reset() {
 	r.body = nil
 	r.timeout = 0
 	r.maxRedirects = 0
+	r.redirectSensitiveHeaders = crosshost.HeaderNames{}
 	r.bodyType = noBody
 	r.boundary = boundary
 	r.isPathNormalizingDisabled = false
@@ -752,11 +771,28 @@ type QueryParam struct {
 
 // Keys returns all keys from the query parameters.
 func (p *QueryParam) Keys() []string {
-	keys := make([]string, 0, p.Len())
-	for key := range p.All() {
-		keys = append(keys, utils.UnsafeString(key))
+	return uniqueKeys(p.All(), p.Len())
+}
+
+// uniqueKeys returns each key once, in order of first appearance.
+func uniqueKeys(all iter.Seq2[[]byte, []byte], n int) []string {
+	keys := make([]string, 0, n)
+	seen := make(map[string]struct{}, n)
+	for key := range all {
+		k := utils.UnsafeString(key)
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			keys = append(keys, k)
+		}
 	}
-	return slices.Compact(keys)
+	return keys
+}
+
+// Set sets a single parameter, overriding previously set values.
+// It shadows Args.Set, which replaces only the first pair with that key.
+func (p *QueryParam) Set(key, val string) {
+	p.Del(key)
+	p.Args.Set(key, val)
 }
 
 // AddParams adds multiple parameters from a map.
@@ -884,11 +920,7 @@ type FormData struct {
 
 // Keys returns all keys from the form data.
 func (f *FormData) Keys() []string {
-	keys := make([]string, 0, f.Len())
-	for key := range f.All() {
-		keys = append(keys, utils.UnsafeString(key))
-	}
-	return slices.Compact(keys)
+	return uniqueKeys(f.All(), f.Len())
 }
 
 // Add adds a single form field.
@@ -898,6 +930,7 @@ func (f *FormData) Add(key, val string) {
 
 // Set sets a single form field, overriding previously set values.
 func (f *FormData) Set(key, val string) {
+	f.Del(key)
 	f.Args.Set(key, val)
 }
 

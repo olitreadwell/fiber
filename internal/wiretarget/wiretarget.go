@@ -7,10 +7,32 @@ import (
 	"bytes"
 	"strings"
 
-	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/internal/appconfig"
 	"github.com/gofiber/utils/v2"
 	"github.com/valyala/fasthttp"
+)
+
+// Ctx is what this package reads of a fiber.Ctx, App being *fiber.App. Naming
+// either would be an import cycle: package fiber serves net/http handlers here.
+type Ctx[App any] interface {
+	App() App
+	OriginalURL() string
+	Path(override ...string) string
+	Request() *fasthttp.Request
+	Response() *fasthttp.Response
+	RequestCtx() *fasthttp.RequestCtx
+}
+
+// Allowance names what SegmentsAsRouted lets through that it refuses
+// otherwise, for a caller that was told the reader keeps it as sent.
+type Allowance uint8
+
+const (
+	// AllowSlashes lets an escaped slash and an empty segment through.
+	AllowSlashes Allowance = 1 << iota
+	// AllowParameters lets a path parameter through on a segment that has a
+	// name other than "." and "..".
+	AllowParameters
 )
 
 // Routed returns the request target to hand on for c: the path the router
@@ -49,12 +71,12 @@ import (
 // "http://u:pw@evil.example/x", which a request line reads as an absolute URL
 // and so as a host and a credential; rooted, it is the path
 // "/http://u:pw@evil.example/x".
-func Routed(c fiber.Ctx) string {
+func Routed[App any](c Ctx[App]) string {
 	path := c.Path()
 	if path == "" || path[0] != '/' {
 		path = "/" + path
 	}
-	query := queryOf(c)
+	query := queryOf(c.Request())
 	if appconfig.Of(c.App()).UnescapePath {
 		target := make([]byte, 0, len(path)+len(query)+9)
 		target = utils.AppendPathSegmentsEscape(target, path)
@@ -74,6 +96,66 @@ func Routed(c fiber.Ctx) string {
 	target := make([]byte, 0, len(path)+len(query)+9)
 	target = appendPathEscaped(target, path)
 	return utils.UnsafeString(appendQuery(target, query))
+}
+
+// Serve runs handler, a net/http handler adapted by fasthttpadaptor, on a
+// request line that spells the path the router matched (Routed) rather than
+// the one that arrived, and puts the original back afterwards. The two differ
+// for an escaped or non-canonical request, and net/http reads the raw one its
+// own way: "/public/..%2Fadmin" decodes into a URL.Path that http.FileServer
+// cleans to "/admin", although no middleware mounted on "/admin" has run. A
+// routed path whose segments would not survive that reading, one with an
+// empty segment or an escaped slash, is not handed on, nor is one that a
+// handler passing the request on, such as httputil.ReverseProxy, would hand an
+// upstream that reads it as another path: a backslash, or a segment a servlet
+// container strips to a dot or an empty segment ("..;", "/;x/admin"). A path
+// parameter on a named segment is handed on, since net/http reads it as part
+// of the name. Serve reports false, without running handler, for a routed path
+// it does not hand on.
+func Serve[App any](c Ctx[App], handler fasthttp.RequestHandler) bool {
+	target := Routed(c)
+	if !SegmentsAsRouted(target, AllowParameters) {
+		return false
+	}
+	if target == c.OriginalURL() {
+		// the request line already spells the routed path
+		handler(c.RequestCtx())
+		return true
+	}
+	req := c.Request()
+	original := utils.CopyString(c.OriginalURL())
+	SetTarget(c, target)
+	// Buffered, the handler has returned, or panicked, in which case
+	// fasthttpadaptor re-panics here and the recover middleware or error
+	// handler that catches it still has to see the original line. Streaming
+	// or hijacked, the handler is still running with an http.Request whose
+	// URL aliases the request line's storage, so the line is left as the
+	// handler read it.
+	defer func() {
+		if !c.Response().IsBodyStream() && !c.RequestCtx().Hijacked() {
+			req.SetRequestURI(original)
+		}
+	}()
+	handler(c.RequestCtx())
+	return true
+}
+
+// SetTarget sets target, the routed request target, as c's request line.
+// A target that is the line as it arrived is left alone, which spares a second
+// parse of it. Otherwise the host fasthttp parsed is kept: a target that is a
+// path makes fasthttp take the host from the Host header again, while an
+// absolute-form request line names its own, which RFC 9112 Section 3.2.2 says
+// the server uses and which c.Hostname() reported. Kept, the adapted handler
+// sees in r.Host the host Fiber saw.
+func SetTarget[App any](c Ctx[App], target string) {
+	if target == c.OriginalURL() {
+		return
+	}
+	req := c.Request()
+	var buf [64]byte
+	host := append(buf[:0], req.URI().Host()...)
+	req.SetRequestURI(target)
+	req.URI().SetHostBytes(host)
 }
 
 // appendQuery appends query to dst behind a "?", or nothing for an empty one.
@@ -96,38 +178,39 @@ func appendQuery(dst, query []byte) []byte {
 // this is false, as the net/http handler adapters do.
 //
 // It is false as well for a backslash, raw or escaped as "%5C", which WHATWG
-// URL parsers and IIS read as a separator, and for a "." or ".." segment that
-// carries path parameters, such as "..;x", which servlet containers such as
-// Tomcat and Jetty resolve as a dot segment once they strip the parameters:
-// "/public/..;/admin" is "/admin" there.
-func SegmentsAsRouted(target string) bool {
-	return segmentsAsRouted(target, false)
-}
-
-// SegmentsAsRoutedSlashesAside is SegmentsAsRouted without its objection to
-// an escaped slash and an empty segment, for a caller that was told the
-// reader keeps those as sent. A backslash, a forged escape and a dot segment
-// carrying parameters are still refused.
-func SegmentsAsRoutedSlashesAside(target string) bool {
-	return segmentsAsRouted(target, true)
-}
-
-// segmentsAsRouted scans target's path once for what SegmentsAsRouted
-// refuses, leaving out escaped slashes and empty segments when slashes is
-// set.
-func segmentsAsRouted(target string, slashes bool) bool { //nolint:revive // flag-parameter: the two exported wrappers name the cases
+// URL parsers and IIS read as a separator, and for a path parameter, a ";" in
+// any segment. Servlet containers such as Tomcat and Jetty strip the
+// parameters from every segment before they match routes, so "/admin;x/secret"
+// and "/admin;/secret" are "/admin/secret" there, "/;/admin/secret" is
+// "//admin/secret" and so "/admin/secret" once the empty segment is merged,
+// and "/public/..;/admin" is "/admin".
+//
+// allow lets some of this through. A "." or ".." segment that carries
+// parameters, such as "..;x", is refused whatever it says, behind a raw slash
+// or, with AllowSlashes, behind an escaped one: a reader that strips the
+// parameters resolves it as a dot segment, and none has a use for it as a
+// name. A segment made of parameters alone, such as ";x", is an empty segment
+// once they are stripped, and is refused as one unless AllowSlashes is set
+// too; as the last segment it spells the trailing slash and passes.
+func SegmentsAsRouted(target string, allow Allowance) bool {
 	path := pathOf(target)
+	slashes := allow&AllowSlashes != 0
 	segment := 0
 	for i := 0; i < len(path); i++ {
 		switch path[i] {
 		case '/':
-			if !slashes && i+1 < len(path) && path[i+1] == '/' {
+			// An empty segment follows, or ends here: one that began with ";"
+			// is empty once its parameters are stripped.
+			if !slashes && ((i+1 < len(path) && path[i+1] == '/') || (segment < i && path[segment] == ';')) {
 				return false
 			}
 			segment = i + 1
 		case '\\':
 			return false
 		case ';':
+			if allow&AllowParameters == 0 {
+				return false
+			}
 			if name := path[segment:i]; name == "." || name == ".." {
 				return false
 			}
@@ -138,6 +221,11 @@ func segmentsAsRouted(target string, slashes bool) bool { //nolint:revive // fla
 					return false
 				}
 				i += 2
+				if v == '/' {
+					// Let through for a reader that keeps it as sent, but a
+					// dot segment behind it is judged as one behind a raw slash.
+					segment = i + 1
+				}
 			}
 		}
 	}
@@ -235,15 +323,15 @@ func pathOf(target string) string {
 	return path
 }
 
-// queryOf returns the query of c's request target without its "?": the one
+// queryOf returns the query of req's request target without its "?": the one
 // the client sent, unless a handler changed the arguments through QueryArgs(),
 // in which case it is the changed arguments as fasthttp serializes them. A
 // handler that only read them left them parsed, and their serialization then
 // differs from what was sent in spelling alone, which parsing what was sent
 // and serializing that tells apart. Unlike Request.RequestURI, URI.RequestURI
 // leaves the request itself alone.
-func queryOf(c fiber.Ctx) []byte {
-	uri := c.Request().URI()
+func queryOf(req *fasthttp.Request) []byte {
+	uri := req.URI()
 	sent := uri.QueryString()
 	var current []byte
 	requestURI := uri.RequestURI()

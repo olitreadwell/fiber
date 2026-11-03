@@ -12,6 +12,9 @@ Logger middleware for [Fiber](https://github.com/gofiber/fiber) that logs HTTP r
 func New(config ...Config) fiber.Handler
 func RegisterTag(tag string, fn LogFunc) error
 func MustRegisterTag(tag string, fn LogFunc)
+func RegisterContextTag(name string, extract func(ctx any) string)
+func SanitizeValue(s string) string
+func LoggerToWriter[T any](logger log.AllLogger[T], level log.Level) io.Writer
 ```
 
 ## Examples
@@ -177,6 +180,10 @@ Auto-registered tags are access-log tags for `middleware/logger`. The same names
 
 Third-party middleware can expose logger tags with `logger.RegisterTag` or `logger.MustRegisterTag`. Use `sync.Once` so the tag is registered once even when the middleware is initialized multiple times.
 
+`RegisterTag` returns `logger.ErrTagInvalid` when the tag name is empty or the function is `nil`, and `MustRegisterTag` panics with that error. Registering a name again replaces the earlier renderer, and only loggers created afterwards see the change.
+
+To expose a value kept in the request context to both the access log and the [`log` package](../api/log.md#context-tags), call `logger.RegisterContextTag(name, extract)`. The extractor receives a `fiber.Ctx`, a `*fasthttp.RequestCtx` or a `context.Context` and returns the text to log, where an empty string renders nothing. `RegisterContextTag` panics when the name is empty or the extractor is `nil`.
+
 A tag you register replaces the built-in renderer, so it does not inherit the [control-character scrubbing](#control-character-sanitization) the built-in tags apply. Wrap request-derived values in `logger.SanitizeValue`.
 
 ```go
@@ -232,9 +239,13 @@ app.Use(logger.New(logger.Config{
 }))
 ```
 
+### Unknown Tags
+
+A `Format` that names a tag which is neither built in, registered nor listed in `Config.CustomTags` makes `logger.New` panic, so a misspelled `${...}` fails at startup instead of on the first request. The panic value is a `*logger.UnknownTagError`. Its `Tag` field is the tag as written, with the `:parameter` of a parametric tag such as `${query:id}`, `Param` is the parameter, and `Hint` is a suggestion such as `did you mean ${reqHeader:PARAM}?` for a `${reqHeader}` written without its parameter. The error wraps `logger.ErrUnknownTag`, so `errors.Is` and `errors.As` both work on the recovered value.
+
 ### Use Logger Middleware with Other Loggers
 
-To combine the logger middleware with loggers like Zerolog, Zap, or Logrus, use the `LoggerToWriter` helper to adapt them to an `io.Writer`.
+To combine the logger middleware with loggers like Zerolog, Zap, or Logrus, use the `LoggerToWriter` helper to adapt them to an `io.Writer`. It sends each log line to the logger's method for `level`, which is one of `log.LevelTrace`, `log.LevelDebug`, `log.LevelInfo`, `log.LevelWarn` or `log.LevelError`. It panics for a `nil` logger and for `log.LevelFatal` or `log.LevelPanic`.
 
 ```go
 package main
@@ -284,14 +295,16 @@ Writing to `os.File` is goroutine-safe, but custom streams may require locking t
 | CustomTags    | `map[string]LogFunc`                              | Defines custom tag actions for this logger instance. These tags override built-in and globally registered tags with the same name.             | `nil`                                                                 |
 | `Format`   | `string`  | Defines the logging tags. See more in [Predefined Formats](#predefined-formats), or create your own using [Tags](#constants). | `[${time}] ${ip} ${status} - ${latency} ${method} ${path} ${error}\n` (same as `DefaultFormat`) |
 | TimeFormat    | `string`                                          | TimeFormat defines the time format for log timestamps.                                                                                        | `15:04:05`                                                            |
-| TimeZone      | `string`                                          | TimeZone can be specified, such as "UTC" and "America/New_York" and "Asia/Chongqing", etc                                                     | `"Local"`                                                             |
+| TimeZone      | `string`                                          | TimeZone can be specified, such as "UTC" and "America/New_York" and "Asia/Chongqing", etc. An unknown name falls back to `Local`.                                                     | `"Local"`                                                             |
 | TimeInterval  | `time.Duration`                                   | TimeInterval is the delay before the timestamp is updated.                                                                                    | `500 * time.Millisecond`                                              |
 | Stream        | `io.Writer`                                       | Stream is a writer where logs are written.                                                                                                    | `os.Stdout`                                                           |
 | TimeDone      | `<-chan struct{}`                                 | TimeDone stops the background timestamp updater when it is closed.                                                                            | `nil`                                                                 |
 | BeforeHandlerFunc | `func(*Config)`                               | BeforeHandlerFunc runs once before the handler is built, letting you customize colors, template, etc.                                         | `beforeHandlerFunc`                                                   |
-| LoggerFunc    | `func(c fiber.Ctx, data *Data, cfg *Config) error` | Custom logger function for integration with logging libraries (Zerolog, Zap, Logrus, etc). Defaults to Fiber's default logger if not defined. | `see default_logger.go defaultLoggerInstance`                         |
+| LoggerFunc    | `func(c fiber.Ctx, data *Data, cfg *Config) error` | Custom logger function for integration with logging libraries (Zerolog, Zap, Logrus, etc). Defaults to Fiber's default logger if not defined. `Skip` and `Done` are applied by the default logger only, so a custom function reads them from `cfg` itself. `Data.TemplateChain` and `Data.LogFuncChain` are shared by all requests: read them, never modify them. | `see default_logger.go defaultLoggerInstance`                         |
 | DisableColors | `bool`                                            | DisableColors defines if the logs output should be colorized.                                                                                 | `false`                                                               |
 | ForceColors   | `bool`                                            | ForceColors defines if the logs output should be colorized even when the output is not a terminal.                                             | `false`                                                               |
+
+Colors are on when logs go to the default `os.Stdout` and `DisableColors` is off, or when `ForceColors` is set. On `os.Stdout`, Fiber strips the escape sequences when stdout is not a terminal, `TERM` is `dumb` or `NO_COLOR` is `1`, unless `ForceColors` is set.
 
 ## Default Config
 
@@ -307,7 +320,7 @@ var ConfigDefault = Config{
     Stream:            os.Stdout,
     BeforeHandlerFunc: beforeHandlerFunc,
     LoggerFunc:        defaultLoggerInstance,
-    enableColors:      true,
+    areColorsEnabled:  true,
 }
 ```
 
@@ -329,6 +342,14 @@ Logger provides predefined formats that you can use by name or directly by speci
 
 :::tip
 `${resBody}` logs nothing for a streamed response (`SendStream`, `SendStreamWriter`, and `SendFile` for a large file). Reading such a body would pull the whole stream into memory and turn the response into a buffered one — an SSE route would deliver nothing until its writer finished — so logging leaves it alone.
+:::
+
+:::tip
+`${body}` logs what `Ctx.Body()` returns, so a compressed request body is logged decoded and a `Content-Encoding` that cannot be undone logs the error text. With [`StreamRequestBody`](../api/fiber.md#streamrequestbody), `${body}` and `${form:}` read a streamed request body the handler left unread within `BodyLimit`, `${form:}` only a form body; for a larger one `${body}` logs the error message and `${form:}` searches only the query string. Unlike a call from a handler, the tags never answer such a request with `415`, `501` or `413`: the response goes out as the handler left it.
+:::
+
+:::note
+For a request the timeout middleware gave up on, `${status}`, `${bytesSent}`, `${resBody}`, `${respHeader:}` and the status column of the default format report the timeout response the client receives, not the response the timed-out handler may still be writing. Tags that read the request log nothing for such a request, since the timed-out handler may still read or change it and even fasthttp's reads change state the two would share: `${body}`, `${cookie:}`, `${form:}`, `${ips}`, `${locals:}`, `${query:}`, `${queryParams}`, `${referer}`, `${reqHeader:}`, `${reqHeaders}` and `${ua}`, and behind a trusted proxy also `${ip}`, `${host}`, `${scheme}` and the IP column of the default format. The logger returns the timeout error for such a request instead of `nil`, since the error handler does not answer it: middleware registered before the logger that skips its work on an error, such as `cache`, `compress`, `etag` or `idempotency`, then leaves the response to the timed-out handler instead of storing or rewriting it. An error-handling middleware registered before the logger receives that error too, so it should check `c.IsAbandoned()` before it writes a response.
 :::
 
 ## The `${ips}` tag

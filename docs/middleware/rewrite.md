@@ -26,6 +26,10 @@ A rule's `From` is path text: `*` matches a run of any bytes but a newline, and
 every other byte stands for itself, so `/preis-1.000-euro` rewrites that path
 and not `/preis-1X000-euro`. There is no escape for a literal `*`.
 
+A rule matches the whole path, trailing slash and letter case included: `/old` rewrites `/old`, but not `/old/`, `/OLD`, `/old/x` or `/very/old`.
+
+In `To`, `$1`, `$2` and so on stand for what the asterisks of `From` captured, in order. `$10` is the tenth capture in a rule with ten or more asterisks; in a rule with fewer it reads as `$1` followed by `0`.
+
 Setting both `RuleList` and `Rules` panics.
 
 Rules match `c.Path()`, the path as the router normalized it, and the rewritten
@@ -34,6 +38,12 @@ decoded one, so a capture is escaped again before it is inserted: the `%2e%2e`
 that `/files/%252e%252e/secret` decoded to stays that name in `/public/$1`
 rather than being decoded a second time into `..` and resolving out of
 `/public/`.
+
+A capture cannot add a `.` or `..` segment either. `{From: "/@*", To: "/users/$1"}`
+cuts `../admin` out of `/@../admin`, a path with no dot segment for the router to
+resolve, so a rewritten path holding more dot segments than `To` itself is not
+used: the next rule is tried and the path stays as it was. `%2e` counts as a dot
+there, and a backslash, `%2f` and `%5c` as a slash.
 
 ## Rule order
 
@@ -58,6 +68,15 @@ asterisks, then the key itself. That is a rough reading of "most specific", not
 an exact one, so a long wildcard rule can still outrank a shorter exact one.
 `RuleList` is the exact control.
 :::
+
+## Middleware order
+
+After a rewrite, the request goes on to the routes registered after the
+middleware that match the new path. Middleware registered before it had its turn
+with the original path and is not run again, so register the rewrite ahead
+of the middleware that must see the new path, such as an auth guard for it. To
+run the whole chain for the new path, call
+[`RestartRouting`](../api/ctx.md#restartrouting) from a handler of your own instead.
 
 ## Examples
 

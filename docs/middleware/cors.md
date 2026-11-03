@@ -10,7 +10,7 @@ It adds CORS headers to responses, listing allowed origins, methods, and headers
 
 Use the `AllowOrigins` option to define which origins may send cross-origin requests. It accepts single origins, lists, subdomain patterns, wildcards, and supports dynamic validation with `AllowOriginsFunc`.
 
-The middleware normalizes `AllowOrigins`, verifies HTTP/HTTPS schemes, and strips trailing slashes. Invalid origins cause a panic. Panic messages and logs redact misconfigured origins by default; set `DisableValueRedaction` to `true` if you need the raw value for troubleshooting.
+The middleware normalizes `AllowOrigins` (the scheme and host are lowercased and a trailing slash is stripped) and panics on an entry that is not a bare origin: the entry needs a host and may carry no userinfo, path, query, or fragment. Any scheme is accepted, not only HTTP and HTTPS, but the check does not require one: `example.com` panics, while `//example.com` is accepted and stored as `://example.com`, which no browser sends as an `Origin`, so it never matches a request. Always write the scheme out. The panic message redacts the misconfigured origin by default; set `DisableValueRedaction` to `true` if you need the raw value for troubleshooting.
 
 Avoid [common pitfalls](#common-pitfalls) such as using wildcard origins with credentials, overly permissive origin lists, or skipping validation with `AllowOriginsFunc`, as misconfiguration can create security risks.
 
@@ -35,7 +35,7 @@ Once your Fiber app is initialized, apply the middleware in one of the following
 
 ### Basic usage
 
-To use the default configuration, simply use `cors.New()`. This will allow wildcard origins '*', all methods, no credentials, and no headers or exposed headers.
+To use the default configuration, simply use `cors.New()`. This will allow wildcard origins '*', the methods `GET, POST, HEAD, PUT, DELETE, PATCH, QUERY`, no credentials, and no exposed headers. Because `AllowHeaders` is empty, a preflight response echoes the headers listed in the request's `Access-Control-Request-Headers`.
 
 ```go
 app.Use(cors.New())
@@ -113,12 +113,12 @@ panic: [CORS] Configuration error: When 'AllowCredentials' is set to true, 'Allo
 | Property             | Type                        | Description                                                                                                                                                                                                                                                                                                                                                          | Default                                 |
 |:---------------------|:----------------------------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:----------------------------------------|
 | AllowCredentials     | `bool`                      | AllowCredentials indicates whether or not the response to the request can be exposed when the credentials flag is true. When used as part of a response to a preflight request, this indicates whether or not the actual request can be made using credentials. Note: If true, AllowOrigins cannot be set to a wildcard (`"*"`) to prevent security vulnerabilities. | `false`                                 |
-| AllowHeaders         | `[]string`                  | AllowHeaders defines a list of request headers that can be used when making the actual request. This is in response to a preflight request.                                                                                                                                                                                                                          | `[]`                                    |
+| AllowHeaders         | `[]string`                  | AllowHeaders defines a list of request headers that can be used when making the actual request. This is in response to a preflight request. If the list is empty, the preflight response echoes the request's `Access-Control-Request-Headers` instead, which allows every header the request names. A list whose only entry is an empty string (`[]string{""}`) counts as configured and allows no headers. | `[]`                                    |
 | AllowMethods         | `[]string`                  | AllowMethods defines a list of methods allowed when accessing the resource. This is used in response to a preflight request.                                                                                                                                                                                                                                         | `"GET, POST, HEAD, PUT, DELETE, PATCH, QUERY"` |
 | AllowOrigins         | `[]string`                  | AllowOrigins defines a list of origins that may access the resource. This supports subdomain matching, so you can use a value like "https://*.example.com" to allow any subdomain of example.com to submit requests. If the special wildcard `"*"` is present in the list, all origins will be allowed.                                                              | `["*"]`                                 |
-| AllowOriginsFunc     | `func(origin string) bool`  | `AllowOriginsFunc` is a function that dynamically determines whether to allow a request based on its origin. If this function returns `true`, the 'Access-Control-Allow-Origin' response header will be set to the request's 'origin' header. This function is only used if the request's origin doesn't match any origin in `AllowOrigins`.                         | `nil`                                   |
-| AllowPrivateNetwork  | `bool`                      | Indicates whether the `Access-Control-Allow-Private-Network` response header should be set to `true`, allowing requests from private networks. This aligns with modern security practices for web applications interacting with private networks.                                                                                                                    | `false`                                 |
-| DisableValueRedaction | `bool`                    | Disables redaction of misconfigured origins and settings in panics and logs. | `false`                                 |
+| AllowOriginsFunc     | `func(origin string) bool`  | `AllowOriginsFunc` is a function that dynamically determines whether to allow a request based on its origin. If this function returns `true`, the 'Access-Control-Allow-Origin' response header will be set to the request's 'origin' header, provided that header is a serialized origin (scheme and host, without userinfo, path, query, or fragment) or the literal `null`. This function is only used if the request's origin doesn't match any origin in `AllowOrigins`.                         | `nil`                                   |
+| AllowPrivateNetwork  | `bool`                      | Indicates whether the `Access-Control-Allow-Private-Network` response header should be set to `true` on a preflight request that carries `Access-Control-Request-Private-Network: true`, allowing requests from private networks. This aligns with modern security practices for web applications interacting with private networks.                                                                                                                    | `false`                                 |
+| DisableValueRedaction | `bool`                    | Disables redaction of the misconfigured origin in the panic message. | `false`                                 |
 | ExposeHeaders        | `[]string`                    | ExposeHeaders defines an allowlist of headers that clients are allowed to access.                                                                                                                                                                                                                                                                                    | `[]`                                    |
 | MaxAge               | `int`                       | MaxAge indicates how long (in seconds) the results of a preflight request can be cached. If you pass MaxAge 0, the Access-Control-Max-Age header will not be added and the browser will use 5 seconds by default. To disable caching completely, pass MaxAge value negative. It will set the Access-Control-Max-Age header to 0.                                     | `0`                                     |
 | Next                 | `func(fiber.Ctx) bool`      | Next defines a function to skip this middleware when it returns true.                                                                                                                                                                                                                                                                                                  | `nil`                                   |
@@ -184,7 +184,7 @@ The `AllowOrigins` option controls which origins can make cross-origin requests.
 
 - **Single origin:** If `AllowOrigins` is set to a single origin like `"http://www.example.com"`, and that origin matches the origin of the incoming request, the middleware adds the header `Access-Control-Allow-Origin: http://www.example.com` to the response.
 
-- **Multiple origins:** If `AllowOrigins` is set to multiple origins like `"https://example.com, https://www.example.com"`, the middleware picks the origin that matches the origin of the incoming request.
+- **Multiple origins:** If `AllowOrigins` is set to multiple origins like `[]string{"https://example.com", "https://www.example.com"}`, the middleware picks the origin that matches the origin of the incoming request.
 
 - **Subdomain matching:** If `AllowOrigins` includes `"https://*.example.com"`, a subdomain like `https://sub.example.com` will be matched and `"https://sub.example.com"` will be the header. This will also match `https://sub.sub.example.com` and so on, but not `https://example.com`.
 
@@ -204,7 +204,7 @@ In all cases above, except the **Wildcard origin**, the middleware will either a
 
 The `AllowMethods` option controls which HTTP methods are allowed. For example, if `AllowMethods` is set to `"GET, POST"`, the middleware adds the header `Access-Control-Allow-Methods: GET, POST` to the response.
 
-The `AllowHeaders` option specifies which headers are allowed in the actual request. The middleware sets the Access-Control-Allow-Headers response header to the value of `AllowHeaders`. This informs the client which headers it can use in the actual request.
+The `AllowHeaders` option specifies which headers are allowed in the actual request. The middleware sets the Access-Control-Allow-Headers response header to the value of `AllowHeaders`. This informs the client which headers it can use in the actual request. If `AllowHeaders` is empty, the middleware sets Access-Control-Allow-Headers to the value of the request's `Access-Control-Request-Headers` header (a header repeated on several lines is combined into one comma-separated list) and omits it when the request names no headers. List the headers you accept in `AllowHeaders` to avoid allowing every header a client asks for.
 
 The `AllowCredentials` option indicates whether the response to the request can be exposed when the credentials flag is true. If `AllowCredentials` is set to `true`, the middleware adds the header `Access-Control-Allow-Credentials: true` to the response. To prevent security vulnerabilities, `AllowCredentials` cannot be set to `true` if `AllowOrigins` is set to a wildcard (`*`).
 
@@ -212,7 +212,7 @@ The `ExposeHeaders` option defines an allowlist of headers that clients are allo
 
 The `MaxAge` option indicates how long the results of a preflight request can be cached. If `MaxAge` is set to `3600`, the middleware adds the header `Access-Control-Max-Age: 3600` to the response.
 
-The `Vary` header helps caches store the correct response. For simple requests the middleware sets `Vary: Origin` unless all origins are allowed. Preflight responses add `Vary: Origin, Access-Control-Request-Method, Access-Control-Request-Headers` (and `Access-Control-Request-Private-Network` when enabled and requested). This ensures caches know when to reuse a response and when to revalidate with the server.
+The `Vary` header helps caches store the correct response. For simple requests the middleware sets `Vary: Origin` unless all origins are allowed. When all origins are allowed, `Access-Control-Allow-Origin: *` (and `Access-Control-Expose-Headers`) is static and is also sent in response to requests without an `Origin` header, `OPTIONS` excepted, so any stored response can be reused for a cross-origin request. Preflight responses add `Vary: Origin, Access-Control-Request-Method, Access-Control-Request-Headers` (and `Access-Control-Request-Private-Network` when enabled and requested). This ensures caches know when to reuse a response and when to revalidate with the server.
 
 ## Infrastructure Considerations
 
@@ -261,6 +261,8 @@ For CORS preflight requests to work correctly, these headers **must not be strip
 - `Access-Control-Request-Headers` - Optional, contains custom headers the actual request will use
 - `Access-Control-Request-Private-Network` - Optional, for private network access requests
 
+The middleware matches these header names case-insensitively, so lowercase names such as the ones HTTP/2 clients send also work when `DisableHeaderNormalizing` is set.
+
 :::warning Critical Preflight Requirement
 If the `Access-Control-Request-Method` header is missing from an OPTIONS request, Fiber will not recognize them as CORS preflight requests. Instead, they'll be treated as regular OPTIONS requests, which typically return `405 Method Not Allowed` since most applications don't define explicit OPTIONS handlers.
 :::
@@ -274,14 +276,14 @@ The middleware sets these response headers based on your configuration:
 - `Access-Control-Allow-Origin` - Set to the allowed origin or "*"
 - `Access-Control-Allow-Credentials` - Set to "true" when `AllowCredentials: true`
 - `Access-Control-Expose-Headers` - Lists headers the client can access
-- `Vary` - Set to "Origin" (unless wildcard origins are used)
+- `Vary` - Set to "Origin" (unless wildcard origins are used, which send `Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers` on every non-`OPTIONS` response instead)
 
 **For preflight responses only:**
 
 - `Access-Control-Allow-Methods` - Lists allowed HTTP methods
 - `Access-Control-Allow-Headers` - Lists allowed request headers (or echoes the request)
 - `Access-Control-Max-Age` - Cache duration for preflight results (if MaxAge > 0)
-- `Access-Control-Allow-Private-Network` - Set to "true" when private network access is allowed
+- `Access-Control-Allow-Private-Network` - Set to "true" when `AllowPrivateNetwork` is enabled and the preflight carries `Access-Control-Request-Private-Network: true`
 - `Vary` - Set to "Access-Control-Request-Method, Access-Control-Request-Headers, Origin"
 
 ### Common Infrastructure Issues
@@ -315,7 +317,7 @@ Add this middleware **before** your CORS configuration to debug what headers Fib
 ```go
 // Debug middleware to log CORS preflight requests
 // Only use in development or testing environments
-app.Use(func(c *fiber.Ctx) error {
+app.Use(func(c fiber.Ctx) error {
     if c.Method() == "OPTIONS" {
         fmt.Printf("OPTIONS %s\n", c.Path())
         fmt.Printf("  Origin: %s\n", c.Get("Origin"))
@@ -352,6 +354,7 @@ curl -X GET https://your-app.com/api/test \
 The middleware sets appropriate `Vary` headers to ensure proper caching:
 
 - **Non-wildcard origins**: `Vary: Origin` is set to cache responses per origin
+- **Wildcard origins**: no `Vary: Origin`; `Access-Control-Allow-Origin: *` is sent whether or not the request carries an `Origin` header, so every stored response serves a cross-origin request
 - **Preflight requests**: `Vary: Access-Control-Request-Method, Access-Control-Request-Headers, Origin`
 - **OPTIONS without preflight headers**: `Vary: Origin` to avoid cache poisoning
 
@@ -385,7 +388,7 @@ When configuring CORS, misconfiguration can potentially expose your application 
 
 ### Secure Configurations
 
-- **Specify Allowed Origins**: Instead of using a wildcard (`"*"`), specify the exact domains allowed to make requests. For example, `AllowOrigins: "https://www.example.com, https://api.example.com"` ensures only these domains can make cross-origin requests to your application.
+- **Specify Allowed Origins**: Instead of using a wildcard (`"*"`), specify the exact domains allowed to make requests. For example, `AllowOrigins: []string{"https://www.example.com", "https://api.example.com"}` ensures only these domains can make cross-origin requests to your application.
 
 - **Use Credentials Carefully**: If your application needs to support credentials in cross-origin requests, ensure `AllowCredentials` is set to `true` and specify exact origins in `AllowOrigins`. Do not use a wildcard origin in this case.
 

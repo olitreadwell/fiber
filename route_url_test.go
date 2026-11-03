@@ -2,14 +2,11 @@ package fiber
 
 import (
 	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"testing"
 
+	"github.com/gofiber/fiber/v3/internal/apptest"
 	"github.com/stretchr/testify/require"
-	"github.com/valyala/fasthttp"
 )
 
 // Test_Route_URL_ParameterRepresentability checks rejection through all URL
@@ -38,6 +35,8 @@ func Test_Route_URL_ParameterRepresentability(t *testing.T) {
 		{name: "decoded greedy slash", pattern: "/files/*", key: "*", value: "a/b", unescape: true, want: "/files/a/b"},
 		{name: "decoded plus slash", pattern: "/files/+", key: "+", value: "a/b", unescape: true, want: "/files/a/b"},
 		{name: "single byte terminator consumes slash", pattern: "/p/:value-", key: "value", value: "a/b", unescape: true, want: "/p/a%2Fb-"},
+		{name: "encoded slash stays in optional terminator", pattern: "/p/:value?-", key: "value", value: "a/b", want: "/p/a%2Fb-"},
+		{name: "decoded slash leaves optional terminator", pattern: "/p/:value?-", key: "value", value: "a/b", unescape: true, reject: true},
 		{name: "adjacent parameter consumes slash", pattern: "/p/:value:tail", key: "value", value: "/", unescape: true, want: "/p/%2Fb"},
 		{name: "adjacent parameter cannot consume middle slash", pattern: "/p/:value:tail", key: "value", value: "a/b", unescape: true, reject: true},
 		{name: "adjacent parameter cannot consume leading slash", pattern: "/p/:value:tail", key: "value", value: "/a", unescape: true, reject: true},
@@ -55,8 +54,7 @@ func Test_Route_URL_ParameterRepresentability(t *testing.T) {
 			t.Parallel()
 			app := New(Config{UnescapePath: tc.unescape})
 			app.Get(tc.pattern, func(c Ctx) error { return c.SendString(c.Params(tc.key)) }).Name("target")
-			ctx := app.AcquireCtx(&fasthttp.RequestCtx{})
-			defer app.ReleaseCtx(ctx)
+			ctx := apptest.Ctx(t, app)
 			params := Map{tc.key: tc.value, "tail": "b"}
 			location, routeErr := app.GetRoute("target").URL(params)
 			ctxLocation, ctxErr := ctx.GetRouteURL("target", params)
@@ -76,14 +74,9 @@ func Test_Route_URL_ParameterRepresentability(t *testing.T) {
 			require.Equal(t, tc.want, location)
 			require.Equal(t, location, ctxLocation)
 			require.Equal(t, location, string(ctx.Response().Header.Peek(HeaderLocation)))
-			response, err := app.Test(httptest.NewRequest(MethodGet, location, http.NoBody))
-			require.NoError(t, err)
-			defer func() { require.NoError(t, response.Body.Close()) }()
-			require.Equal(t, StatusOK, response.StatusCode)
-			body, err := io.ReadAll(response.Body)
-			require.NoError(t, err)
-			value := string(body)
+			value := apptest.Body(t, apptest.Expect(t, app, location, StatusOK))
 			if !tc.unescape {
+				var err error
 				value, err = url.PathUnescape(value)
 				require.NoError(t, err)
 			}
@@ -92,8 +85,6 @@ func Test_Route_URL_ParameterRepresentability(t *testing.T) {
 	}
 }
 
-// Test_Route_URL_MountedRepresentabilityConfig verifies that mounted routes
-// and their automatic HEAD copies validate using the parent's decoding policy.
 func Test_Route_urlHasDotSegment(t *testing.T) {
 	t.Parallel()
 	route := &Route{}
@@ -107,6 +98,8 @@ func Test_Route_urlHasDotSegment(t *testing.T) {
 	}
 }
 
+// Test_Route_URL_MountedRepresentabilityConfig verifies that mounted routes
+// and their automatic HEAD copies validate using the parent's decoding policy.
 func Test_Route_URL_MountedRepresentabilityConfig(t *testing.T) {
 	t.Parallel()
 	for _, parentUnescape := range []bool{false, true} {

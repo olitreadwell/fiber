@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"strings"
 	"sync"
 	"time"
@@ -95,11 +96,6 @@ func lookupCachedHeader(headers []cachedHeader, name string) ([]byte, bool) {
 	return nil, false
 }
 
-// setCookie2 is the obsolete RFC 2965 spelling of Set-Cookie. fasthttp keeps it
-// as an ordinary field rather than in its cookie store, so it has to be looked
-// up separately.
-const setCookie2 = "Set-Cookie2"
-
 // cachedHeadersSetCookie reports whether a stored entry carries a cookie. Only
 // an entry written before Set-Cookie joined ignoreHeaders can, so this asks
 // about a persisted store an older version filled, not about anything this one
@@ -108,7 +104,7 @@ func cachedHeadersSetCookie(headers []cachedHeader) bool {
 	if _, ok := lookupCachedHeader(headers, fiber.HeaderSetCookie); ok {
 		return true
 	}
-	_, ok := lookupCachedHeader(headers, setCookie2)
+	_, ok := lookupCachedHeader(headers, fiber.HeaderSetCookie2)
 	return ok
 }
 
@@ -119,9 +115,10 @@ func responseSetsCookie(h *fasthttp.ResponseHeader, normalized bool) bool { //no
 		return true
 	}
 	// Not PeekAll(Set-Cookie): fasthttp answers that from its cookie store and
-	// returns one empty entry when there is none. Set-Cookie2 has no store, so it
-	// is found only under the spelling the handler wrote.
-	for _, v := range fieldname.Lines(h, setCookie2, normalized) {
+	// returns one empty entry when there is none. The obsolete RFC 2965
+	// Set-Cookie2 is an ordinary field to fasthttp, with no store, so it is
+	// found only under the spelling the handler wrote.
+	for _, v := range fieldname.Lines(h, fiber.HeaderSetCookie2, normalized) {
 		if len(v) > 0 {
 			return true
 		}
@@ -195,18 +192,6 @@ func isIgnoredHeader(key []byte) bool {
 
 	_, ok := ignoredHeaderNames[string(lower)]
 	return ok
-}
-
-// varyListsCredential is true when a Vary field value names Cookie or
-// Authorization: the entry then holds the response to one client's credential.
-// Walked rather than parsed, so a hit allocates nothing for it.
-func varyListsCredential(vary []byte) bool {
-	for name := range headerlist.All(utils.UnsafeString(vary)) {
-		if utils.EqualFold(name, fiber.HeaderCookie) || utils.EqualFold(name, fiber.HeaderAuthorization) {
-			return true
-		}
-	}
-	return false
 }
 
 // joinedHeader returns every field line for key, comma-joined, since a recipient
@@ -283,13 +268,36 @@ var authScratchPool = sync.Pool{
 	},
 }
 
-// appendAuthHash appends the hex digest of a request's Authorization field
-// lines, each length-prefixed so that ["ab"] and ["a","b"] do not collide.
+// maxStackFraming is the framing hashed from the stack: enough for a cookie, an API key or a token.
+const maxStackFraming = 256
+
+// framedLen is the length of the lines once each is preceded by its length as a uvarint.
+func framedLen(lines [][]byte) int {
+	n := 0
+	for _, v := range lines {
+		n += (bits.Len64(uint64(len(v))|1)+6)/7 + len(v)
+	}
+	return n
+}
+
+// appendAuthHash appends the hex digest of a credential's field lines (Authorization, a
+// credential header or a cookie), each length-prefixed so that ["ab"] and ["a","b"] do not collide.
 //
 // Written into the caller's buffer rather than returned as a string: the digest
 // only ever becomes part of a cache key, and handing one back cost an
 // allocation per authenticated request on top of the key's own.
 func appendAuthHash(dst []byte, lines [][]byte) []byte {
+	if framedLen(lines) <= maxStackFraming {
+		var stack [maxStackFraming]byte
+		framed := stack[:0]
+		for _, v := range lines {
+			framed = binary.AppendUvarint(framed, uint64(len(v)))
+			framed = append(framed, v...)
+		}
+		sum := sha256.Sum256(framed)
+		return hex.AppendEncode(dst, sum[:])
+	}
+
 	scratchPtr, ok := authScratchPool.Get().(*[]byte)
 	if !ok || scratchPtr == nil {
 		b := make([]byte, 0, 256)

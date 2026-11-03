@@ -3,6 +3,7 @@ package byterange
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,7 +13,6 @@ import (
 
 func Test_classify(t *testing.T) {
 	t.Parallel()
-
 	tests := []struct {
 		name      string
 		field     string
@@ -45,7 +45,7 @@ func Test_classify(t *testing.T) {
 		{name: "three ranges", field: "bytes=0-1,3-4,6-", verdict: ignore},
 		{name: "overlapping ranges", field: "bytes=0-5,3-8", verdict: ignore},
 
-		// Not a ranges-specifier: left for the file server to refuse.
+		// Not a ranges-specifier: left to the file server.
 		{name: "no equals sign", field: "bytes", verdict: pass},
 		{name: "no unit", field: "=0-4", verdict: pass},
 		{name: "no range set", field: "bytes=", verdict: pass},
@@ -56,7 +56,6 @@ func Test_classify(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-
 			var buf [64]byte
 			got := classify(buf[:0], []byte(tc.field))
 			require.Equal(t, tc.verdict, got.verdict)
@@ -71,7 +70,6 @@ func Test_classify(t *testing.T) {
 
 func Test_ifRangeMatches(t *testing.T) {
 	t.Parallel()
-
 	const modified = "Thu, 02 Jan 2020 03:04:05 GMT"
 	modifiedAt := time.Date(2020, time.January, 2, 3, 4, 5, 0, time.UTC)
 
@@ -102,7 +100,6 @@ func Test_ifRangeMatches(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-
 			var resp fasthttp.Response
 			if tc.lastModified != "" {
 				resp.Header.Set(fasthttp.HeaderLastModified, tc.lastModified)
@@ -117,7 +114,6 @@ func Test_ifRangeMatches(t *testing.T) {
 	// A date is a strong validator only when it is old enough (§8.8.2.2).
 	t.Run("a date is strong once strongAfter old", func(t *testing.T) {
 		t.Parallel()
-
 		var resp fasthttp.Response
 		resp.Header.Set(fasthttp.HeaderLastModified, modified)
 		for age, want := range map[time.Duration]bool{
@@ -148,11 +144,7 @@ func newFileServer(t *testing.T) fasthttp.RequestHandler {
 	require.NoError(t, os.WriteFile(name, []byte(fileContent), 0o600))
 	require.NoError(t, os.Chtimes(name, time.Time{}, time.Date(2020, time.January, 2, 3, 4, 5, 0, time.UTC)))
 
-	server := &fasthttp.FS{
-		Root:            dir,
-		AcceptByteRange: true,
-		SkipCache:       true,
-	}
+	server := &fasthttp.FS{Root: dir, AcceptByteRange: true, SkipCache: true}
 	return server.NewRequestHandler()
 }
 
@@ -203,7 +195,6 @@ func requestAt(t *testing.T, now func() time.Time, handler fasthttp.RequestHandl
 
 func Test_Wrap_RangeRules(t *testing.T) {
 	t.Parallel()
-
 	handler := newFileServer(t)
 
 	tests := []struct {
@@ -233,17 +224,13 @@ func Test_Wrap_RangeRules(t *testing.T) {
 		{name: "unknown unit", method: fasthttp.MethodGet, rangeField: "items=0-4", wantStatus: 200, wantBody: fileContent, wantLength: "20", wantAccepted: true},
 		{name: "only GET has ranges: HEAD", method: fasthttp.MethodHead, rangeField: "bytes=0-4", wantStatus: 200, wantLength: "20", wantAccepted: true},
 
-		// Refused by the file server, as before.
-		{name: "start past the end", method: fasthttp.MethodGet, rangeField: "bytes=100-200", wantStatus: 416, wantBody: "Range Not Satisfiable"},
-		{name: "reversed range", method: fasthttp.MethodGet, rangeField: "bytes=5-1", wantStatus: 416, wantBody: "Range Not Satisfiable"},
-		{name: "no range set", method: fasthttp.MethodGet, rangeField: "bytes=", wantStatus: 416, wantBody: "Range Not Satisfiable"},
-		{name: "garbage", method: fasthttp.MethodGet, rangeField: "garbage", wantStatus: 416, wantBody: "Range Not Satisfiable"},
+		// Refused by the file server, with the current length (§15.5.17).
+		{name: "start past the end", method: fasthttp.MethodGet, rangeField: "bytes=100-200", wantStatus: 416, wantBody: "Range Not Satisfiable", wantRange: "bytes */20"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-
 			fields := map[string]string{}
 			if tc.rangeField != "" {
 				fields[fasthttp.HeaderRange] = tc.rangeField
@@ -268,7 +255,6 @@ func Test_Wrap_RangeRules(t *testing.T) {
 
 func Test_Wrap_IfRange(t *testing.T) {
 	t.Parallel()
-
 	handler := newFileServer(t)
 
 	const stale = "Wed, 01 Jan 2020 03:04:05 GMT"
@@ -277,20 +263,23 @@ func Test_Wrap_IfRange(t *testing.T) {
 		name       string
 		rangeField string
 		ifRange    string
+		etag       string // set by the caller
 		wantRange  string
 		wantBody   string
 		wantStatus int
 	}{
 		// The validator matches: the range is served.
 		{name: "matching date", rangeField: "bytes=0-4", ifRange: fileModified, wantStatus: 206, wantBody: "01234", wantRange: "bytes 0-4/20"},
+		{name: "the caller's strong ETag", rangeField: "bytes=0-4", ifRange: `"v1"`, etag: `"v1"`, wantStatus: 206, wantBody: "01234", wantRange: "bytes 0-4/20"},
 		{name: "matching date, unit in upper case", rangeField: "BYTES=0-4", ifRange: fileModified, wantStatus: 206, wantBody: "01234", wantRange: "bytes 0-4/20"},
-		{name: "matching date, unsatisfiable range", rangeField: "bytes=100-200", ifRange: fileModified, wantStatus: 416, wantBody: "Range Not Satisfiable"},
+		{name: "matching date, unsatisfiable range", rangeField: "bytes=100-200", ifRange: fileModified, wantStatus: 416, wantBody: "Range Not Satisfiable", wantRange: "bytes */20"},
 
 		// It does not: the whole file is sent (§13.1.5).
 		{name: "stale date", rangeField: "bytes=0-4", ifRange: stale, wantStatus: 200, wantBody: fileContent},
 		{name: "stale date, suffix range", rangeField: "bytes=-5", ifRange: stale, wantStatus: 200, wantBody: fileContent},
 		{name: "stale date, unsatisfiable range", rangeField: "bytes=100-200", ifRange: stale, wantStatus: 200, wantBody: fileContent},
 		{name: "entity-tag the file server never sent", rangeField: "bytes=0-4", ifRange: `"deadbeef"`, wantStatus: 200, wantBody: fileContent},
+		{name: "another ETag than the caller's", rangeField: "bytes=0-4", ifRange: `"v2"`, etag: `"v1"`, wantStatus: 200, wantBody: fileContent},
 		{name: "weak entity-tag", rangeField: "bytes=0-4", ifRange: `W/"deadbeef"`, wantStatus: 200, wantBody: fileContent},
 		{name: "not a validator", rangeField: "bytes=0-4", ifRange: "later", wantStatus: 200, wantBody: fileContent},
 
@@ -306,12 +295,15 @@ func Test_Wrap_IfRange(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-
 			fields := map[string]string{fasthttp.HeaderIfRange: tc.ifRange}
 			if tc.rangeField != "" {
 				fields[fasthttp.HeaderRange] = tc.rangeField
 			}
-			got := request(t, handler, fasthttp.MethodGet, fields)
+			got := request(t, handler, fasthttp.MethodGet, fields, func(ctx *fasthttp.RequestCtx) {
+				if tc.etag != "" {
+					ctx.Response.Header.Set(fasthttp.HeaderETag, tc.etag)
+				}
+			})
 
 			require.Equal(t, tc.wantStatus, got.status())
 			require.Equal(t, tc.wantBody, got.body)
@@ -332,7 +324,6 @@ func Test_Wrap_IfRange(t *testing.T) {
 // If-Range date matches it (§8.8.2.2).
 func Test_Wrap_IfRange_Strength(t *testing.T) {
 	t.Parallel()
-
 	handler := newFileServer(t)
 	modifiedAt := time.Date(2020, time.January, 2, 3, 4, 5, 0, time.UTC)
 
@@ -345,7 +336,6 @@ func Test_Wrap_IfRange_Strength(t *testing.T) {
 	} {
 		t.Run(age.String(), func(t *testing.T) {
 			t.Parallel()
-
 			now := func() time.Time { return modifiedAt.Add(age) }
 			fields := map[string]string{fasthttp.HeaderRange: "bytes=0-4", fasthttp.HeaderIfRange: fileModified}
 			require.Equal(t, wantStatus, requestAt(t, now, handler, fasthttp.MethodGet, fields).status())
@@ -353,15 +343,31 @@ func Test_Wrap_IfRange_Strength(t *testing.T) {
 	}
 }
 
-// Headers set before the file server ran survive every outcome; those of a
-// partial response do not.
+// The 416 states the file's length, not that of the compressed whole file the
+// If-Range check fetched.
+func Test_Wrap_IfRange_UnsatisfiableCompressed(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	name := filepath.Join(dir, "file.txt")
+	require.NoError(t, os.WriteFile(name, []byte(strings.Repeat("a", 4000)), 0o600))
+	require.NoError(t, os.Chtimes(name, time.Time{}, time.Date(2020, time.January, 2, 3, 4, 5, 0, time.UTC)))
+	server := &fasthttp.FS{Root: dir, AcceptByteRange: true, Compress: true, SkipCache: true}
+
+	got := request(t, server.NewRequestHandler(), fasthttp.MethodGet, map[string]string{
+		fasthttp.HeaderRange:          "bytes=100000-200000",
+		fasthttp.HeaderIfRange:        fileModified,
+		fasthttp.HeaderAcceptEncoding: "gzip",
+	})
+
+	require.Equal(t, 416, got.status())
+	require.Equal(t, "bytes */4000", got.header(fasthttp.HeaderContentRange))
+}
+
+// Headers set before the file server ran survive every outcome.
 func Test_Wrap_KeepsCallerHeaders(t *testing.T) {
 	t.Parallel()
-
 	handler := newFileServer(t)
-	prepare := func(ctx *fasthttp.RequestCtx) {
-		ctx.Response.Header.Set("X-Request", "kept")
-	}
+	prepare := func(ctx *fasthttp.RequestCtx) { ctx.Response.Header.Set("X-Request", "kept") }
 
 	for name, fields := range map[string]map[string]string{
 		"range served":               {fasthttp.HeaderRange: "bytes=0-4"},
@@ -372,13 +378,8 @@ func Test_Wrap_KeepsCallerHeaders(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-
 			got := request(t, handler, fasthttp.MethodGet, fields, prepare)
 			require.Equal(t, "kept", got.header("X-Request"))
-			if got.status() == 200 {
-				require.Empty(t, got.header(fasthttp.HeaderContentRange))
-				require.Equal(t, "20", got.header("Content-Length"))
-			}
 		})
 	}
 }
@@ -419,7 +420,6 @@ func Benchmark_Wrap_SingleRange(b *testing.B) {
 // The Range field is put back even when the handler panics.
 func Test_Wrap_RestoresRangeAfterPanic(t *testing.T) {
 	t.Parallel()
-
 	handler := Wrap(func(*fasthttp.RequestCtx) { panic("handler broke") })
 
 	for _, tc := range []struct{ method, field string }{

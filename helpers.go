@@ -6,6 +6,7 @@ package fiber
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -31,6 +32,7 @@ import (
 	"github.com/gofiber/fiber/v3/binder"
 	"github.com/gofiber/fiber/v3/internal/contextvalue"
 	etagpkg "github.com/gofiber/fiber/v3/internal/etag"
+	"github.com/gofiber/fiber/v3/internal/fieldname"
 	"github.com/gofiber/fiber/v3/internal/headerlist"
 	"github.com/gofiber/fiber/v3/internal/mediatype"
 	"github.com/gofiber/fiber/v3/log"
@@ -149,7 +151,7 @@ func getTLSConfig(ln net.Listener) *tls.Config {
 	}
 
 	if field.CanInterface() {
-		if cfg, ok := field.Interface().(*tls.Config); ok {
+		if cfg, ok := reflect.TypeAssert[*tls.Config](field); ok {
 			return cfg
 		}
 		return nil
@@ -164,7 +166,7 @@ func getTLSConfig(ln net.Listener) *tls.Config {
 		return nil
 	}
 
-	cfg, ok := value.Interface().(*tls.Config)
+	cfg, ok := reflect.TypeAssert[*tls.Config](value)
 	if !ok {
 		return nil
 	}
@@ -515,8 +517,8 @@ func paramsMatch(specParamStr headerParams, offerParams string) bool {
 		fasthttp.VisitHeaderParams(utils.UnsafeBytes(offerParams), func(key, value []byte) bool {
 			if utils.EqualFold(specParam, utils.UnsafeString(key)) {
 				foundParam = true
-				unescaped, err := unescapeHeaderValue(value)
-				if err != nil {
+				unescaped, ok := mediatype.Unescape(value)
+				if !ok {
 					allSpecParamsMatch = false
 					return false
 				}
@@ -570,11 +572,35 @@ func lookupJoinedRequestHeader(h *fasthttp.RequestHeader, key string) ([]byte, b
 	//
 	// VisitAllInOrder is deliberately not used: it reparses rawHeaders, which
 	// only holds headers read off the wire, so headers set programmatically
-	// (e.g. by net/http adaptors) would be missed entirely. VisitAll already
-	// preserves the relative order of repeated field lines sharing a key,
-	// which is all this helper needs; it only reorders across distinct keys.
+	// (e.g. by net/http adaptors) would be missed entirely. VisitAll keeps
+	// repeated field lines in received order only until a line is removed,
+	// see fieldname.ReceivedOrder.
 	h.VisitAll(j.visit)
 	return j.combined, j.seen
+}
+
+// peekReceivedRequestHeader is peekJoinedRequestHeader for a chain whose line
+// order decides whom to trust, such as X-Forwarded-For.
+func peekReceivedRequestHeader(req *fasthttp.Request, key string) []byte {
+	j := joinedHeaderValue{key: key}
+	req.Header.VisitAll(j.visit)
+	if !j.multi {
+		return j.combined
+	}
+	raw := fieldname.Received(req)
+	if len(raw) == 0 || fieldname.JoinedInReceivedOrder(raw, key, j.combined) {
+		return j.combined
+	}
+	// Rejoined in the buffer JoinNext allocated, which the lines do not alias.
+	joined, n := j.combined[:0], 0
+	fieldname.ReceivedOrder(&req.Header, raw, key, func(v []byte) {
+		if n > 0 {
+			joined = append(joined, ',')
+		}
+		joined = append(joined, v...)
+		n++
+	})
+	return joined
 }
 
 // peekJoinedResponseHeader is peekJoinedRequestHeader for response headers.
@@ -585,34 +611,6 @@ func peekJoinedResponseHeader(h *fasthttp.ResponseHeader, key string) ([]byte, b
 	// deprecation is suppressed for helpers.go in .golangci.yml.
 	h.VisitAll(j.visit)
 	return j.combined, j.multi
-}
-
-func unescapeHeaderValue(v []byte) ([]byte, error) {
-	if bytes.IndexByte(v, '\\') == -1 {
-		return v, nil
-	}
-	res := make([]byte, 0, len(v))
-	escaping := false
-	for i, c := range v {
-		if escaping {
-			res = append(res, c)
-			escaping = false
-			continue
-		}
-		if c == '\\' {
-			// invalid escape at end of string
-			if i == len(v)-1 {
-				return nil, errInvalidEscapeSequence
-			}
-			escaping = true
-			continue
-		}
-		res = append(res, c)
-	}
-	if escaping {
-		return nil, errInvalidEscapeSequence
-	}
-	return res, nil
 }
 
 // forEachMediaRange parses an Accept or Content-Type header, calling functor
@@ -730,8 +728,8 @@ func getOffer(header []byte, isAccepted func(spec, offer string, specParams head
 						return false
 					}
 					lowerKey := utils.UnsafeString(utilsbytes.UnsafeToLower(key))
-					val, err := unescapeHeaderValue(value)
-					if err != nil {
+					val, ok := mediatype.Unescape(value)
+					if !ok {
 						return true
 					}
 					params[lowerKey] = val
@@ -863,11 +861,28 @@ func offerQuality(types []acceptedType, isAccepted func(spec, offer string, spec
 	return quality, rank, bestSpecificity > 0 && quality > 0
 }
 
+// maxInsertionSortedTypes is the longest list sortAcceptedTypes sorts by insertion.
+const maxInsertionSortedTypes = 32
+
 // sortAcceptedTypes sorts accepted types by quality and specificity, preserving order of equal elements
 // A type with parameters has higher priority than an equivalent one without parameters.
 // e.g., text/html;a=1;b=2 comes before text/html;a=1
 // See: https://www.rfc-editor.org/rfc/rfc9110#name-content-negotiation-fields
 func sortAcceptedTypes(at []acceptedType) {
+	// The insertion sort swaps once per inversion, quadratic in a list the client controls.
+	if len(at) > maxInsertionSortedTypes {
+		// order is unique, so no two elements tie and an unstable sort is exact.
+		slices.SortFunc(at, func(a, b acceptedType) int {
+			return cmp.Or(
+				cmp.Compare(b.quality, a.quality),
+				cmp.Compare(b.specificity, a.specificity),
+				cmp.Compare(len(b.params), len(a.params)),
+				cmp.Compare(a.order, b.order),
+			)
+		})
+		return
+	}
+
 	for i := 1; i < len(at); i++ {
 		lo, hi := 0, i-1
 		for lo <= hi {
@@ -1258,7 +1273,9 @@ func genericParseType[V GenericType](str string) (V, error) {
 	switch any(v).(type) {
 	case int:
 		result, err := utils.ParseInt(str)
-		if err != nil {
+		// int is 32 bits on 386 and arm: reject a value that does not fit
+		// instead of wrapping it.
+		if err != nil || int64(int(result)) != result {
 			return v, errParseValue
 		}
 		return any(int(result)).(V), nil //nolint:errcheck,forcetypeassert // not needed
@@ -1288,7 +1305,8 @@ func genericParseType[V GenericType](str string) (V, error) {
 		return any(result).(V), nil //nolint:errcheck,forcetypeassert // not needed
 	case uint:
 		result, err := utils.ParseUint(str)
-		if err != nil {
+		// uint is 32 bits on 386 and arm, as int is above.
+		if err != nil || uint64(uint(result)) != result {
 			return v, errParseValue
 		}
 		return any(uint(result)).(V), nil //nolint:errcheck,forcetypeassert // not needed

@@ -9,7 +9,6 @@ import (
 // Test_Escape covers each output dialect and the no-allocation fast path.
 func Test_Escape(t *testing.T) {
 	t.Parallel()
-
 	cases := []struct {
 		name string
 		in   string
@@ -41,11 +40,21 @@ func Test_Escape(t *testing.T) {
 // mutate an earlier result.
 func Test_Escape_DetachesFromPooledBuffer(t *testing.T) {
 	t.Parallel()
-
 	first := Escape(`A\B`)
 	second := Escape(`C"D`)
 
 	require.Equal(t, `A\\B`, first)
 	require.Equal(t, `C\"D`, second)
 	require.Equal(t, `A\\B`, first)
+}
+
+func Benchmark_Escape(b *testing.B) {
+	for _, input := range []string{"simple", "a-long-clean-header-value", "café", `a-long-value-with-a-quote"`, "value\x00"} {
+		b.Run(input, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				Escape(input)
+			}
+		})
+	}
 }

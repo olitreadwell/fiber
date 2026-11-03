@@ -1,12 +1,9 @@
-//go:build go1.18
-
 package fiber
 
 import (
 	"testing"
 )
 
-// go test -v -run=^$ -fuzz=FuzzUtilsGetOffer
 func FuzzUtilsGetOffer(f *testing.F) {
 	inputs := []string{
 		`application/json; v=1; foo=bar; q=0.938; extra=param, text/plain;param="big fox"; q=0.43`,
