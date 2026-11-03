@@ -69,7 +69,7 @@ it from happening again.
 ### Secure accounts with access
 
 The [Fiber Organization](https://github.com/gofiber) requires 2FA authorization
-for all of it's members.
+for all of its members.
 
 ### Critical Updates And Security Notices
 
