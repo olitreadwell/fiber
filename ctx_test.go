@@ -2746,7 +2746,7 @@ func Test_Ctx_HeaderWrittenUnderTrailerName_StreamedBody(t *testing.T) {
 			ln := startRawServer(t, app)
 
 			const chunked = "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n"
-			many := rawFieldLines("X-", "v", fieldname.MaxTrailers-2)
+			many := apptest.FieldLines("X-", "v", fieldname.MaxTrailers-2)
 			heads := []string{"", "X-User: admin\r\nX-Role: admin\r\n", "X-User: admin\r\nTrailer: X-User, X-Role\r\n"}
 			post := func(path, head, trailers string) string {
 				return "POST " + path + " HTTP/1.1\r\nHost: example.com\r\n" + head + chunked + trailers +
@@ -2870,6 +2870,11 @@ func Test_Ctx_Host_ForwardedHost(t *testing.T) {
 		{name: "no whitespace with comma", proxies: trusted, forwardedHost: "example.com, proxy1", want: "example.com"},
 		{name: "single value with whitespace", proxies: trusted, forwardedHost: "  example.com  ", want: "example.com"},
 		{name: "leading comma", proxies: trusted, forwardedHost: ",example.com", want: ""},
+		{name: "empty header", proxies: trusted, forwardedHost: "", want: "google.com"},
+		{name: "whitespace only", proxies: trusted, forwardedHost: " \t ", want: ""},
+		{name: "whitespace first element", proxies: trusted, forwardedHost: " \t ,example.com", want: ""},
+		{name: "consecutive commas", proxies: trusted, forwardedHost: "example.com,,proxy1", want: "example.com"},
+		{name: "trailing comma", proxies: trusted, forwardedHost: "example.com,", want: "example.com"},
 	}
 
 	// No host carries a port, so every case answers alike through c.Host and c.Hostname.
@@ -4584,6 +4589,10 @@ func Test_Ctx_Scheme(t *testing.T) {
 		{name: "X-Forwarded-Protocol", header: HeaderXForwardedProtocol, value: schemeHTTPS},
 		{name: "X-Forwarded-Proto list", header: HeaderXForwardedProto, value: "https, http"},
 		{name: "X-Forwarded-Protocol list", header: HeaderXForwardedProtocol, value: "https, http"},
+		{name: "X-Forwarded-Proto empty tail", header: HeaderXForwardedProto, value: "https,,"},
+		{name: "X-Forwarded-Protocol empty tail", header: HeaderXForwardedProtocol, value: "https,,"},
+		{name: "X-Forwarded-Proto tab padding", header: HeaderXForwardedProto, value: "\tHTTPS\t, invalid"},
+		{name: "X-Forwarded-Protocol tab padding", header: HeaderXForwardedProtocol, value: "\tHTTPS\t, invalid"},
 		{name: "X-Forwarded-Ssl", header: HeaderXForwardedSsl, value: "on"},
 		{name: "X-Url-Scheme", header: HeaderXUrlScheme, value: schemeHTTPS},
 		{name: "lowercase X-Forwarded-Proto, padded list", header: "x-forwarded-proto", value: " HTTPS , http"},
@@ -4634,7 +4643,7 @@ func Test_Ctx_Scheme_RejectsForeignSchemes(t *testing.T) {
 	// A scheme Fiber does not serve must never reach BaseURL or the
 	// same-origin comparisons that consume Scheme.
 	for _, header := range []string{HeaderXForwardedProto, HeaderXForwardedProtocol, HeaderXUrlScheme} {
-		for _, value := range []string{"javascript", "ftp", "data", "HTTPS evil", ""} {
+		for _, value := range []string{"javascript", "ftp", "data", "HTTPS evil", "", ",https", " \t,https", ",,https", "javascript,https"} {
 			c.Request().Header.Set(header, value)
 			require.Equal(t, schemeHTTP, c.Scheme(), "%s: %q", header, value)
 			c.Request().Header.Reset()
@@ -4708,6 +4717,16 @@ func Test_Ctx_Scheme_HeaderPrecedence(t *testing.T) {
 				HeaderXForwardedProto, "javascript", HeaderXForwardedSsl, "off", HeaderXUrlScheme, schemeHTTPS,
 			},
 			want: schemeHTTPS,
+		},
+		{
+			name:    "empty first proto element retains the lower priority scheme",
+			headers: []string{HeaderXUrlScheme, schemeHTTP, HeaderXForwardedProto, ",https"},
+			want:    schemeHTTP,
+		},
+		{
+			name:    "empty first protocol element retains the lower priority scheme",
+			headers: []string{HeaderXUrlScheme, schemeHTTP, HeaderXForwardedProtocol, " \t,https"},
+			want:    schemeHTTP,
 		},
 	} {
 		t.Run("Ranking, "+tc.name, func(t *testing.T) {
@@ -8950,8 +8969,8 @@ func Benchmark_Ctx_GetReqHeaders_TrailerSection(b *testing.B) {
 		b.Run(strconv.Itoa(n), func(b *testing.B) {
 			c := apptest.Ctx(b, New())
 
-			raw := "POST / HTTP/1.1\r\nHost: example.com\r\n" + rawFieldLines("H", "1", n) +
-				"Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n" + rawFieldLines("T", "1", n) + "\r\n"
+			raw := "POST / HTTP/1.1\r\nHost: example.com\r\n" + apptest.FieldLines("H", "1", n) +
+				"Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n" + apptest.FieldLines("T", "1", n) + "\r\n"
 			require.NoError(b, c.Request().Read(bufio.NewReaderSize(strings.NewReader(raw), len(raw))))
 			require.Len(b, c.Request().Header.PeekTrailerKeys(), n)
 
